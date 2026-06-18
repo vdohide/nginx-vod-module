@@ -242,12 +242,22 @@ ngx_http_vod_sprite_parse_uri_file_name(
 	request_params_t* request_params,
 	const ngx_http_vod_request_t** request)
 {
+	ngx_int_t rc;
+
 	// check for sprite.vtt
 	if ((size_t)(end_pos - start_pos) == conf->sprite.file_name_prefix.len + sizeof(vtt_file_ext) - 1 &&
 		ngx_memcmp(start_pos, conf->sprite.file_name_prefix.data, conf->sprite.file_name_prefix.len) == 0 &&
 		ngx_memcmp(start_pos + conf->sprite.file_name_prefix.len, vtt_file_ext, sizeof(vtt_file_ext) - 1) == 0)
 	{
 		*request = &sprite_vtt_request;
+
+		// parse the required tracks string (initializes tracks_mask)
+		rc = ngx_http_vod_parse_uri_file_name(r, end_pos, end_pos, 0, request_params);
+		if (rc != NGX_OK)
+		{
+			return rc;
+		}
+
 		vod_track_mask_reset_all_bits(request_params->tracks_mask[MEDIA_TYPE_AUDIO]);
 		vod_track_mask_reset_all_bits(request_params->tracks_mask[MEDIA_TYPE_SUBTITLE]);
 		return NGX_OK;
@@ -322,6 +332,13 @@ ngx_http_vod_sprite_parse_uri_file_name(
 		}
 	}
 
+	// parse the required tracks string (initializes tracks_mask)
+	rc = ngx_http_vod_parse_uri_file_name(r, start_pos, end_pos, 0, request_params);
+	if (rc != NGX_OK)
+	{
+		return rc;
+	}
+
 	vod_track_mask_reset_all_bits(request_params->tracks_mask[MEDIA_TYPE_AUDIO]);
 	vod_track_mask_reset_all_bits(request_params->tracks_mask[MEDIA_TYPE_SUBTITLE]);
 
@@ -340,3 +357,4 @@ ngx_http_vod_sprite_parse_drm_info(
 }
 
 DEFINE_SUBMODULE(sprite);
+

@@ -35,7 +35,6 @@ ngx_http_vod_sprite_handle_metadata(
 	uint32_t tile_height;
 	uint32_t tiles_per_page = cols * rows;
 	uint32_t total_tiles;
-	uint32_t total_pages;
 	uint32_t tile_idx;
 	uint32_t page, col, row;
 	u_char* p;
@@ -79,7 +78,6 @@ ngx_http_vod_sprite_handle_metadata(
 	}
 
 	total_tiles = (uint32_t)((duration_ms + interval_ms - 1) / interval_ms);
-	total_pages = (total_tiles + tiles_per_page - 1) / tiles_per_page;
 
 	// estimate size: "WEBVTT\n\n" + per tile ~120 bytes
 	alloc_size = 16 + total_tiles * 150;

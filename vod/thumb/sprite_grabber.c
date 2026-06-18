@@ -549,12 +549,18 @@ sprite_grabber_frame_is_safe_to_decode(
 
 	nal_length_size = sprite_grabber_get_nal_length_size(request_context, media_info);
 
+	if (nal_length_size == 0 || nal_length_size > 4)
+	{
+		return TRUE;
+	}
+
 	while (cur + nal_length_size <= size)
 	{
 		nal_size = sprite_grabber_read_nal_size(buffer + cur, nal_length_size);
 		cur += nal_length_size;
 
-		if (nal_size == 0 || cur + nal_size > size)
+		// guard against integer overflow / truncated NAL framing
+		if (nal_size == 0 || nal_size > size || cur > size - nal_size)
 		{
 			break;
 		}
@@ -674,12 +680,20 @@ sprite_grabber_decode_tile(sprite_grabber_state_t* state)
 		return VOD_UNEXPECTED;
 	}
 
+	vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+		"sprite_grabber_decode_tile: STAGE tile-top tile=%uD reuse=%uD",
+		state->cur_tile,
+		(uint32_t)(state->cur_keyframe == state->last_decoded_keyframe));
+
 	if (state->cur_keyframe == state->last_decoded_keyframe &&
 		sprite_grabber_validate_frame(
 			state->working_frame, state->request_context->log, state->cur_tile))
 	{
 		return VOD_OK;
 	}
+
+	vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+		"sprite_grabber_decode_tile: STAGE idr-check tile=%uD", state->cur_tile);
 
 	if (frame->key_frame &&
 		!sprite_grabber_frame_is_safe_to_decode(
@@ -830,6 +844,10 @@ sprite_grabber_start_next_tile(sprite_grabber_state_t* state)
 
 		state->cur_keyframe = frame;
 		state->cur_keyframe_dts = keyframe_dts;
+
+		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+			"sprite_grabber_start_next_tile: STAGE next-found tile=%uD off=%uD kf_size=%uD",
+			state->cur_tile, frame_offset_ms, frame_size);
 
 		// set up reading from this frame's source
 		state->frames_source = part->frames_source;
@@ -1307,6 +1325,10 @@ sprite_grabber_process(void* context)
 				return VOD_AGAIN;  // need more data from framework
 			}
 
+			vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+				"sprite_grabber_process: STAGE read-done tile=%uD accum=%uD",
+				state->cur_tile, state->frame_buffer_size);
+
 			state->cur_state = SPRITE_STATE_DECODE;
 			/* fall through */
 
@@ -1344,6 +1366,9 @@ sprite_grabber_process(void* context)
 				"sprite_grabber_process: libswscale is required for sprite generation");
 			return VOD_BAD_REQUEST;
 #endif
+
+			vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+				"sprite_grabber_process: STAGE place-done tile=%uD", state->cur_tile);
 
 			// advance to next tile
 			state->cur_tile++;

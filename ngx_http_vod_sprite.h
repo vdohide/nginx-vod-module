@@ -1,6 +1,10 @@
 #ifndef _NGX_HTTP_VOD_SPRITE_H_INCLUDED_
 #define _NGX_HTTP_VOD_SPRITE_H_INCLUDED_
 
-#include <ngx_http.h>
+// includes
+#include "ngx_http_vod_submodule.h"
+
+// globals
+extern const ngx_http_vod_submodule_t sprite;
 
 #endif // _NGX_HTTP_VOD_SPRITE_H_INCLUDED_

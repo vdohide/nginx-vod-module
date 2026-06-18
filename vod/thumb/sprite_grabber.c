@@ -2,10 +2,10 @@
 #include "../media_set.h"
 
 #include <libavcodec/avcodec.h>
+#include <libavutil/imgutils.h>
 
 #if (VOD_HAVE_LIB_SW_SCALE)
 #include <libswscale/swscale.h>
-#include <libavutil/imgutils.h>
 #endif // VOD_HAVE_LIB_SW_SCALE
 
 // typedefs
@@ -43,7 +43,6 @@ typedef struct
 
 	// tile processing state
 	uint32_t cur_tile;
-	bool_t initialized;
 
 } sprite_grabber_state_t;
 
@@ -266,6 +265,7 @@ sprite_grabber_init_state(
 {
 	sprite_grabber_state_t* state;
 	vod_pool_cleanup_t *cln;
+	vod_status_t rc;
 	int avrc;
 
 	if (sprite_encoder_codec == NULL)
@@ -324,14 +324,13 @@ sprite_grabber_init_state(
 	state->page = page;
 	state->total_tiles = cols * rows;
 	state->cur_tile = 0;
-	state->initialized = FALSE;
 
 	// get video duration
 	state->video_duration_ms = sprite_grabber_get_duration_ms(track, 
 		track->media_info.frames_timescale);
 
 	// init decoder
-	vod_status_t rc = sprite_grabber_init_decoder(request_context, &track->media_info, &state->decoder);
+	rc = sprite_grabber_init_decoder(request_context, &track->media_info, &state->decoder);
 	if (rc != VOD_OK)
 	{
 		return rc;
@@ -438,33 +437,35 @@ sprite_grabber_decode_keyframe(
 	}
 
 	// read frame data
-	uint32_t total_read = 0;
-	for (;;)
 	{
-		uint8_t* read_buffer;
-		uint32_t read_size;
-		bool_t frame_done;
-
-		rc = part->frames_source->read(
-			part->frames_source_context,
-			&read_buffer,
-			&read_size,
-			&frame_done);
-		if (rc != VOD_OK)
+		uint32_t total_read = 0;
+		for (;;)
 		{
-			if (rc == VOD_AGAIN)
+			uint8_t* read_buffer;
+			uint32_t read_size;
+			bool_t frame_done;
+
+			rc = part->frames_source->read(
+				part->frames_source_context,
+				&read_buffer,
+				&read_size,
+				&frame_done);
+			if (rc != VOD_OK)
 			{
-				continue;
+				if (rc == VOD_AGAIN)
+				{
+					continue;
+				}
+				return rc;
 			}
-			return rc;
-		}
 
-		vod_memcpy(buffer + total_read, read_buffer, read_size);
-		total_read += read_size;
+			vod_memcpy(buffer + total_read, read_buffer, read_size);
+			total_read += read_size;
 
-		if (frame_done)
-		{
-			break;
+			if (frame_done)
+			{
+				break;
+			}
 		}
 	}
 
@@ -533,54 +534,59 @@ sprite_grabber_resize_and_place(
 	}
 
 	// allocate temp tile buffer
-	int avrc = av_image_alloc(tile_data, tile_linesize,
-		state->tile_width, state->tile_height, AV_PIX_FMT_YUV420P, 16);
-	if (avrc < 0)
 	{
+		int avrc;
+		uint32_t y;
+
+		avrc = av_image_alloc(tile_data, tile_linesize,
+			state->tile_width, state->tile_height, AV_PIX_FMT_YUV420P, 16);
+		if (avrc < 0)
+		{
+			sws_freeContext(sws_ctx);
+			return VOD_ALLOC_FAILED;
+		}
+
+		// scale
+		sws_scale(sws_ctx,
+			(const uint8_t* const*)input_frame->data, input_frame->linesize,
+			0, input_frame->height,
+			tile_data, tile_linesize);
+
 		sws_freeContext(sws_ctx);
-		return VOD_ALLOC_FAILED;
+
+		// copy tile pixels into canvas at (col, row) position
+		x_offset = col * state->tile_width;
+		y_offset = row * state->tile_height;
+
+		// Y plane
+		for (y = 0; y < state->tile_height; y++)
+		{
+			memcpy(
+				state->canvas_data[0] + (y_offset + y) * state->canvas_linesize[0] + x_offset,
+				tile_data[0] + y * tile_linesize[0],
+				state->tile_width);
+		}
+
+		// U plane (half resolution)
+		for (y = 0; y < state->tile_height / 2; y++)
+		{
+			memcpy(
+				state->canvas_data[1] + (y_offset / 2 + y) * state->canvas_linesize[1] + x_offset / 2,
+				tile_data[1] + y * tile_linesize[1],
+				state->tile_width / 2);
+		}
+
+		// V plane (half resolution)
+		for (y = 0; y < state->tile_height / 2; y++)
+		{
+			memcpy(
+				state->canvas_data[2] + (y_offset / 2 + y) * state->canvas_linesize[2] + x_offset / 2,
+				tile_data[2] + y * tile_linesize[2],
+				state->tile_width / 2);
+		}
+
+		av_freep(&tile_data[0]);
 	}
-
-	// scale
-	sws_scale(sws_ctx,
-		(const uint8_t* const*)input_frame->data, input_frame->linesize,
-		0, input_frame->height,
-		tile_data, tile_linesize);
-
-	sws_freeContext(sws_ctx);
-
-	// copy tile pixels into canvas at (col, row) position
-	x_offset = col * state->tile_width;
-	y_offset = row * state->tile_height;
-
-	// Y plane
-	for (uint32_t y = 0; y < state->tile_height; y++)
-	{
-		memcpy(
-			state->canvas_data[0] + (y_offset + y) * state->canvas_linesize[0] + x_offset,
-			tile_data[0] + y * tile_linesize[0],
-			state->tile_width);
-	}
-
-	// U plane (half resolution)
-	for (uint32_t y = 0; y < state->tile_height / 2; y++)
-	{
-		memcpy(
-			state->canvas_data[1] + (y_offset / 2 + y) * state->canvas_linesize[1] + x_offset / 2,
-			tile_data[1] + y * tile_linesize[1],
-			state->tile_width / 2);
-	}
-
-	// V plane (half resolution)
-	for (uint32_t y = 0; y < state->tile_height / 2; y++)
-	{
-		memcpy(
-			state->canvas_data[2] + (y_offset / 2 + y) * state->canvas_linesize[2] + x_offset / 2,
-			tile_data[2] + y * tile_linesize[2],
-			state->tile_width / 2);
-	}
-
-	av_freep(&tile_data[0]);
 
 	return VOD_OK;
 }

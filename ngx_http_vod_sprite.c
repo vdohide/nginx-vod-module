@@ -280,13 +280,15 @@ ngx_http_vod_sprite_parse_uri_file_name(
 		return ngx_http_vod_status_to_ngx_error(r, VOD_BAD_REQUEST);
 	}
 
-	uint32_t page = 0;
-	while (start_pos < end_pos && *start_pos >= '0' && *start_pos <= '9')
 	{
-		page = page * 10 + (*start_pos++ - '0');
-	}
+		uint32_t page = 0;
+		while (start_pos < end_pos && *start_pos >= '0' && *start_pos <= '9')
+		{
+			page = page * 10 + (*start_pos++ - '0');
+		}
 
-	request_params->segment_index = page;  // reuse segment_index for page
+		request_params->segment_index = page;  // reuse segment_index for page
+	}
 
 	// parse optional width/height: -w{width}[-h{height}]
 	request_params->width = 0;

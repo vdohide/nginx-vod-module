@@ -31,6 +31,7 @@ typedef struct
 	uint32_t tile_height;
 	uint32_t canvas_width;
 	uint32_t canvas_height;
+	uint32_t encode_height;
 	uint32_t interval_ms;
 	uint32_t page;
 	uint32_t total_tiles;
@@ -264,6 +265,82 @@ sprite_grabber_get_duration_ms(media_track_t* track, uint32_t timescale)
 	return (total_duration * 1000) / timescale;
 }
 
+uint64_t
+sprite_grabber_get_track_duration_ms(media_track_t* track)
+{
+	return sprite_grabber_get_duration_ms(track, track->media_info.frames_timescale);
+}
+
+bool_t
+sprite_grabber_is_valid_page(
+	uint64_t duration_ms,
+	uint32_t interval_ms,
+	uint32_t cols,
+	uint32_t rows,
+	uint32_t page)
+{
+	uint32_t tiles_per_page;
+	uint32_t total_content_tiles;
+	uint32_t page_start_tile;
+
+	if (interval_ms == 0)
+	{
+		return FALSE;
+	}
+
+	tiles_per_page = cols * rows;
+	if (tiles_per_page == 0)
+	{
+		return FALSE;
+	}
+
+	total_content_tiles = (uint32_t)((duration_ms + interval_ms - 1) / interval_ms);
+	page_start_tile = page * tiles_per_page;
+
+	return page_start_tile < total_content_tiles;
+}
+
+static vod_status_t
+sprite_grabber_calc_encode_height(
+	uint64_t duration_ms,
+	uint32_t interval_ms,
+	uint32_t cols,
+	uint32_t rows,
+	uint32_t page,
+	uint32_t tile_height,
+	uint32_t* encode_height)
+{
+	uint32_t tiles_per_page;
+	uint32_t total_content_tiles;
+	uint32_t page_start_tile;
+	uint32_t tiles_in_page;
+	uint32_t used_rows;
+
+	if (interval_ms == 0 || cols == 0 || rows == 0)
+	{
+		return VOD_BAD_DATA;
+	}
+
+	tiles_per_page = cols * rows;
+	total_content_tiles = (uint32_t)((duration_ms + interval_ms - 1) / interval_ms);
+	page_start_tile = page * tiles_per_page;
+
+	if (page_start_tile >= total_content_tiles)
+	{
+		return VOD_BAD_DATA;
+	}
+
+	tiles_in_page = total_content_tiles - page_start_tile;
+	if (tiles_in_page > tiles_per_page)
+	{
+		tiles_in_page = tiles_per_page;
+	}
+
+	used_rows = (tiles_in_page + cols - 1) / cols;
+	*encode_height = used_rows * tile_height;
+	return VOD_OK;
+}
+
 // advance to the next valid tile, find its keyframe, and start reading it
 static vod_status_t
 sprite_grabber_start_next_tile(sprite_grabber_state_t* state)
@@ -427,7 +504,7 @@ sprite_grabber_encode_canvas(sprite_grabber_state_t* state)
 	}
 
 	canvas_frame->width = state->canvas_width;
-	canvas_frame->height = state->canvas_height;
+	canvas_frame->height = state->encode_height;
 	canvas_frame->format = AV_PIX_FMT_YUV420P;
 	canvas_frame->data[0] = state->canvas_data[0];
 	canvas_frame->data[1] = state->canvas_data[1];
@@ -540,6 +617,19 @@ sprite_grabber_init_state(
 	state->video_duration_ms = sprite_grabber_get_duration_ms(track,
 		track->media_info.frames_timescale);
 
+	rc = sprite_grabber_calc_encode_height(
+		state->video_duration_ms,
+		interval_ms,
+		cols,
+		rows,
+		page,
+		tile_height,
+		&state->encode_height);
+	if (rc != VOD_OK)
+	{
+		return rc;
+	}
+
 	// init decoder
 	rc = sprite_grabber_init_decoder(request_context, &track->media_info, &state->decoder);
 	if (rc != VOD_OK)
@@ -578,7 +668,7 @@ sprite_grabber_init_state(
 	memset(state->canvas_data[1], 128, state->canvas_linesize[1] * (state->canvas_height / 2));
 	memset(state->canvas_data[2], 128, state->canvas_linesize[2] * (state->canvas_height / 2));
 
-	// init encoder for full canvas
+	// init encoder (width = full canvas, height = used rows only)
 	state->encoder = avcodec_alloc_context3(sprite_encoder_codec);
 	if (state->encoder == NULL)
 	{
@@ -586,7 +676,7 @@ sprite_grabber_init_state(
 	}
 
 	state->encoder->width = state->canvas_width;
-	state->encoder->height = state->canvas_height;
+	state->encoder->height = state->encode_height;
 	state->encoder->time_base = (AVRational){ 1, 1 };
 	state->encoder->pix_fmt = AV_PIX_FMT_YUVJ420P;
 

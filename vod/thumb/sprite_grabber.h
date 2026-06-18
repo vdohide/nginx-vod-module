@@ -15,6 +15,15 @@
 // functions
 void sprite_grabber_process_init(vod_log_t* log);
 
+uint64_t sprite_grabber_get_track_duration_ms(media_track_t* track);
+
+bool_t sprite_grabber_is_valid_page(
+	uint64_t duration_ms,
+	uint32_t interval_ms,
+	uint32_t cols,
+	uint32_t rows,
+	uint32_t page);
+
 vod_status_t sprite_grabber_init_state(
 	request_context_t* request_context,
 	media_track_t* track,

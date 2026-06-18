@@ -142,9 +142,26 @@ ngx_http_vod_sprite_init_frame_processor(
 	ngx_http_vod_loc_conf_t* conf = submodule_context->conf;
 	request_params_t* request_params = &submodule_context->request_params;
 	media_track_t* track = submodule_context->media_set.filtered_tracks;
+	uint64_t duration_ms;
 	uint32_t tile_width;
 	uint32_t tile_height = 0;
 	vod_status_t rc;
+
+	if (track == NULL)
+	{
+		return NGX_HTTP_NOT_FOUND;
+	}
+
+	duration_ms = sprite_grabber_get_track_duration_ms(track);
+	if (!sprite_grabber_is_valid_page(
+		duration_ms,
+		conf->sprite.interval,
+		conf->sprite.cols,
+		conf->sprite.rows,
+		request_params->segment_index))
+	{
+		return NGX_HTTP_NOT_FOUND;
+	}
 
 	tile_width = request_params->width > 0 ? request_params->width : conf->sprite.tile_width;
 	if (request_params->height > 0)

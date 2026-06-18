@@ -751,11 +751,19 @@ sprite_grabber_process(void* context)
 			}
 
 			avrc = avcodec_receive_frame(state->decoder, state->decoded_frame);
+			if (avrc == AVERROR(EAGAIN))
+			{
+				// decoder needs flush to produce the frame
+				avcodec_send_packet(state->decoder, NULL);
+				avrc = avcodec_receive_frame(state->decoder, state->decoded_frame);
+			}
+
 			if (avrc < 0)
 			{
 				vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
 					"sprite_grabber_process: avcodec_receive_frame failed %d at tile %uD",
 					avrc, state->cur_tile);
+				avcodec_flush_buffers(state->decoder);
 				state->cur_tile++;
 				rc = sprite_grabber_start_next_tile(state);
 				if (rc != VOD_OK)

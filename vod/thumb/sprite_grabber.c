@@ -59,6 +59,7 @@ typedef struct
 	void* frames_source_context;
 	u_char* frame_buffer;
 	uint32_t frame_buffer_size;
+	uint32_t max_frame_size;
 
 } sprite_grabber_state_t;
 
@@ -198,6 +199,11 @@ sprite_grabber_find_keyframe_at(
 	part = &track->frames;
 	last_frame = part->last_frame;
 
+	if (part->first_frame == NULL || part->first_frame >= last_frame)
+	{
+		return VOD_NOT_FOUND;
+	}
+
 	for (cur_frame = part->first_frame; ; cur_frame++)
 	{
 		if (cur_frame >= last_frame)
@@ -209,6 +215,10 @@ sprite_grabber_find_keyframe_at(
 			part = part->next;
 			cur_frame = part->first_frame;
 			last_frame = part->last_frame;
+			if (part->first_frame == NULL || part->first_frame >= last_frame)
+			{
+				break;
+			}
 		}
 
 		if (cur_frame->key_frame)
@@ -247,6 +257,11 @@ sprite_grabber_get_duration_ms(media_track_t* track, uint32_t timescale)
 	part = &track->frames;
 	last_frame = part->last_frame;
 
+	if (part->first_frame == NULL || part->first_frame >= last_frame)
+	{
+		return 0;
+	}
+
 	for (cur_frame = part->first_frame; ; cur_frame++)
 	{
 		if (cur_frame >= last_frame)
@@ -258,8 +273,17 @@ sprite_grabber_get_duration_ms(media_track_t* track, uint32_t timescale)
 			part = part->next;
 			cur_frame = part->first_frame;
 			last_frame = part->last_frame;
+			if (part->first_frame == NULL || part->first_frame >= last_frame)
+			{
+				break;
+			}
 		}
 		total_duration += cur_frame->duration;
+	}
+
+	if (timescale == 0)
+	{
+		return 0;
 	}
 
 	return (total_duration * 1000) / timescale;
@@ -268,7 +292,51 @@ sprite_grabber_get_duration_ms(media_track_t* track, uint32_t timescale)
 uint64_t
 sprite_grabber_get_track_duration_ms(media_track_t* track)
 {
-	return sprite_grabber_get_duration_ms(track, track->media_info.frames_timescale);
+	uint64_t duration_ms;
+	uint32_t timescale;
+
+	if (track == NULL)
+	{
+		return 0;
+	}
+
+	timescale = track->media_info.frames_timescale;
+	duration_ms = sprite_grabber_get_duration_ms(track, timescale);
+
+	if (duration_ms == 0 && track->media_info.duration_millis != 0)
+	{
+		duration_ms = track->media_info.duration_millis;
+	}
+
+	if (duration_ms == 0 && track->media_info.duration != 0 && track->media_info.timescale != 0)
+	{
+		duration_ms = (track->media_info.duration * 1000) / track->media_info.timescale;
+	}
+
+	if (duration_ms == 0 && track->media_info.full_duration != 0 && track->media_info.timescale != 0)
+	{
+		duration_ms = (track->media_info.full_duration * 1000) / track->media_info.timescale;
+	}
+
+	if (duration_ms == 0 && track->total_frames_duration != 0 && timescale != 0)
+	{
+		duration_ms = (track->total_frames_duration * 1000) / timescale;
+	}
+
+	return duration_ms;
+}
+
+uint32_t
+sprite_grabber_get_total_content_tiles(
+	uint64_t duration_ms,
+	uint32_t interval_ms)
+{
+	if (interval_ms == 0 || duration_ms == 0)
+	{
+		return 0;
+	}
+
+	return (uint32_t)((duration_ms + interval_ms - 1) / interval_ms);
 }
 
 bool_t
@@ -294,7 +362,12 @@ sprite_grabber_is_valid_page(
 		return FALSE;
 	}
 
-	total_content_tiles = (uint32_t)((duration_ms + interval_ms - 1) / interval_ms);
+	total_content_tiles = sprite_grabber_get_total_content_tiles(duration_ms, interval_ms);
+	if (total_content_tiles == 0)
+	{
+		return TRUE;
+	}
+
 	page_start_tile = page * tiles_per_page;
 
 	return page_start_tile < total_content_tiles;
@@ -322,10 +395,10 @@ sprite_grabber_calc_encode_height(
 	}
 
 	tiles_per_page = cols * rows;
-	total_content_tiles = (uint32_t)((duration_ms + interval_ms - 1) / interval_ms);
+	total_content_tiles = sprite_grabber_get_total_content_tiles(duration_ms, interval_ms);
 	page_start_tile = page * tiles_per_page;
 
-	if (page_start_tile >= total_content_tiles)
+	if (total_content_tiles == 0 || page_start_tile >= total_content_tiles)
 	{
 		return VOD_BAD_DATA;
 	}
@@ -338,6 +411,10 @@ sprite_grabber_calc_encode_height(
 
 	used_rows = (tiles_in_page + cols - 1) / cols;
 	*encode_height = used_rows * tile_height;
+	if (*encode_height == 0)
+	{
+		*encode_height = tile_height;
+	}
 	return VOD_OK;
 }
 
@@ -421,6 +498,14 @@ sprite_grabber_resize_and_place(
 	int tile_linesize[4];
 	uint32_t x_offset, y_offset;
 
+	if (input_frame->width <= 0 || input_frame->height <= 0)
+	{
+		vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+			"sprite_grabber_resize_and_place: invalid decoded frame size at tile %uD",
+			state->cur_tile);
+		return VOD_UNEXPECTED;
+	}
+
 	sws_ctx = sws_getContext(
 		input_frame->width, input_frame->height, input_frame->format,
 		state->tile_width, state->tile_height, AV_PIX_FMT_YUV420P,
@@ -489,7 +574,50 @@ sprite_grabber_resize_and_place(
 
 	return VOD_OK;
 }
+
 #endif // VOD_HAVE_LIB_SW_SCALE
+
+static uint32_t
+sprite_grabber_get_max_keyframe_size(media_track_t* track)
+{
+	frame_list_part_t* part;
+	input_frame_t* cur_frame;
+	input_frame_t* last_frame;
+	uint32_t max_frame_size = 0;
+
+	part = &track->frames;
+	last_frame = part->last_frame;
+
+	if (part->first_frame == NULL || part->first_frame >= last_frame)
+	{
+		return 0;
+	}
+
+	for (cur_frame = part->first_frame; ; cur_frame++)
+	{
+		if (cur_frame >= last_frame)
+		{
+			if (part->next == NULL)
+			{
+				break;
+			}
+			part = part->next;
+			cur_frame = part->first_frame;
+			last_frame = part->last_frame;
+			if (part->first_frame == NULL || part->first_frame >= last_frame)
+			{
+				break;
+			}
+		}
+
+		if (cur_frame->key_frame && cur_frame->size > max_frame_size)
+		{
+			max_frame_size = cur_frame->size;
+		}
+	}
+
+	return max_frame_size;
+}
 
 static vod_status_t
 sprite_grabber_encode_canvas(sprite_grabber_state_t* state)
@@ -553,8 +681,6 @@ sprite_grabber_init_state(
 	vod_status_t rc;
 	int avrc;
 	uint32_t max_frame_size;
-	uint32_t base_offset_ms;
-	uint32_t i;
 
 	if (sprite_encoder_codec == NULL)
 	{
@@ -614,8 +740,7 @@ sprite_grabber_init_state(
 	state->cur_tile = 0;
 
 	// get video duration
-	state->video_duration_ms = sprite_grabber_get_duration_ms(track,
-		track->media_info.frames_timescale);
+	state->video_duration_ms = sprite_grabber_get_track_duration_ms(track);
 
 	rc = sprite_grabber_calc_encode_height(
 		state->video_duration_ms,
@@ -688,34 +813,14 @@ sprite_grabber_init_state(
 		return VOD_UNEXPECTED;
 	}
 
-	// find max frame size across all target keyframes for buffer allocation
-	max_frame_size = 0;
-	base_offset_ms = page * state->total_tiles * interval_ms;
-	for (i = 0; i < state->total_tiles; i++)
-	{
-		uint32_t time_ms;
-		frame_list_part_t* kf_part;
-		input_frame_t* kf_frame;
-		uint32_t kf_size;
-
-		time_ms = base_offset_ms + i * interval_ms;
-		if (time_ms >= state->video_duration_ms)
-		{
-			break;
-		}
-
-		rc = sprite_grabber_find_keyframe_at(track, time_ms,
-			track->media_info.frames_timescale, &kf_part, &kf_frame, &kf_size);
-		if (rc == VOD_OK && kf_size > max_frame_size)
-		{
-			max_frame_size = kf_size;
-		}
-	}
-
+	// find max keyframe size across the entire track for buffer allocation
+	max_frame_size = sprite_grabber_get_max_keyframe_size(track);
 	if (max_frame_size == 0)
 	{
 		max_frame_size = 256 * 1024;  // 256KB fallback
 	}
+
+	state->max_frame_size = max_frame_size;
 
 	// allocate frame buffer (reused for each tile)
 	state->frame_buffer = vod_alloc(request_context->pool,
@@ -776,6 +881,20 @@ sprite_grabber_process(void* context)
 			}
 
 			// accumulate data in frame buffer
+			if (state->frame_buffer_size + read_size > state->max_frame_size)
+			{
+				vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+					"sprite_grabber_process: frame too large %uD bytes (max %uD) at tile %uD",
+					state->frame_buffer_size + read_size, state->max_frame_size, state->cur_tile);
+				state->cur_tile++;
+				rc = sprite_grabber_start_next_tile(state);
+				if (rc != VOD_OK)
+				{
+					return rc;
+				}
+				continue;
+			}
+
 			vod_memcpy(state->frame_buffer + state->frame_buffer_size,
 				read_buffer, read_size);
 			state->frame_buffer_size += read_size;
@@ -808,9 +927,6 @@ sprite_grabber_process(void* context)
 			pkt->data = state->frame_buffer;
 			pkt->size = state->frame_buffer_size;
 			pkt->flags = AV_PKT_FLAG_KEY;
-
-			// reset decoder state before each tile (required after EAGAIN flush)
-			avcodec_flush_buffers(state->decoder);
 
 			avrc = avcodec_send_packet(state->decoder, pkt);
 			av_packet_free(&pkt);

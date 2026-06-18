@@ -17,6 +17,10 @@ void sprite_grabber_process_init(vod_log_t* log);
 
 uint64_t sprite_grabber_get_track_duration_ms(media_track_t* track);
 
+uint32_t sprite_grabber_get_total_content_tiles(
+	uint64_t duration_ms,
+	uint32_t interval_ms);
+
 bool_t sprite_grabber_is_valid_page(
 	uint64_t duration_ms,
 	uint32_t interval_ms,

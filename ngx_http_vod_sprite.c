@@ -142,24 +142,43 @@ ngx_http_vod_sprite_init_frame_processor(
 	ngx_http_vod_loc_conf_t* conf = submodule_context->conf;
 	request_params_t* request_params = &submodule_context->request_params;
 	media_track_t* track = submodule_context->media_set.filtered_tracks;
+	ngx_http_request_t* r = submodule_context->r;
 	uint64_t duration_ms;
+	uint32_t total_content_tiles;
+	uint32_t page_start_tile;
+	uint32_t tiles_per_page;
 	uint32_t tile_width;
 	uint32_t tile_height = 0;
 	vod_status_t rc;
 
 	if (track == NULL)
 	{
+		ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+			"ngx_http_vod_sprite_init_frame_processor: no video track");
 		return NGX_HTTP_NOT_FOUND;
 	}
 
 	duration_ms = sprite_grabber_get_track_duration_ms(track);
-	if (!sprite_grabber_is_valid_page(
-		duration_ms,
-		conf->sprite.interval,
-		conf->sprite.cols,
-		conf->sprite.rows,
-		request_params->segment_index))
+	total_content_tiles = sprite_grabber_get_total_content_tiles(
+		duration_ms, conf->sprite.interval);
+	tiles_per_page = conf->sprite.cols * conf->sprite.rows;
+	page_start_tile = request_params->segment_index * tiles_per_page;
+
+	if (total_content_tiles > 0 &&
+		!sprite_grabber_is_valid_page(
+			duration_ms,
+			conf->sprite.interval,
+			conf->sprite.cols,
+			conf->sprite.rows,
+			request_params->segment_index))
 	{
+		ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+			"ngx_http_vod_sprite_init_frame_processor: sprite page %uiD out of range "
+			"(duration_ms=%uL, total_tiles=%uiD, page_start=%uiD)",
+			request_params->segment_index + 1,
+			duration_ms,
+			total_content_tiles,
+			page_start_tile);
 		return NGX_HTTP_NOT_FOUND;
 	}
 

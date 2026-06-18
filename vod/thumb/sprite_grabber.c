@@ -695,7 +695,7 @@ sprite_grabber_process(void* context)
 			}
 
 			state->cur_state = SPRITE_STATE_DECODE;
-			// fall through
+			/* fall through */
 
 		case SPRITE_STATE_DECODE:
 		{
@@ -751,8 +751,8 @@ sprite_grabber_process(void* context)
 			}
 
 			state->cur_state = SPRITE_STATE_RESIZE_PLACE;
-			// fall through
 		}
+		/* fall through */
 
 		case SPRITE_STATE_RESIZE_PLACE:
 			col = state->cur_tile % state->cols;

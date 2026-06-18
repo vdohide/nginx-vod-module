@@ -30,10 +30,12 @@
 
 #if (NGX_HAVE_LIB_AV_CODEC)
 #include "ngx_http_vod_thumb.h"
+#include "ngx_http_vod_sprite.h"
 #include "ngx_http_vod_volume_map.h"
 #include "vod/filters/audio_decoder.h"
 #include "vod/filters/audio_encoder.h"
 #include "vod/thumb/thumb_grabber.h"
+#include "vod/thumb/sprite_grabber.h"
 #endif // NGX_HAVE_LIB_AV_CODEC
 
 #if (NGX_HAVE_LIBXML2)
@@ -3385,6 +3387,7 @@ ngx_http_vod_init_process(ngx_cycle_t *cycle)
 	audio_decoder_process_init(cycle->log);
 	audio_encoder_process_init(cycle->log);
 	thumb_grabber_process_init(cycle->log);
+	sprite_grabber_process_init(cycle->log);
 #endif // NGX_HAVE_LIB_AV_CODEC
 
 	rc = language_code_process_init(cycle->pool, cycle->log);

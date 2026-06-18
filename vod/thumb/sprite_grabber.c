@@ -1,5 +1,4 @@
 #include "sprite_grabber.h"
-#include "thumb_grabber.h"
 #include "../media_set.h"
 
 #include <libavcodec/avcodec.h>
@@ -48,20 +47,55 @@ typedef struct
 
 } sprite_grabber_state_t;
 
-// globals - reuse from thumb_grabber
-extern const AVCodec *decoder_codec[];
+// codec mapping
+typedef struct {
+	uint32_t codec_id;
+	enum AVCodecID av_codec_id;
+	const char* name;
+} sprite_codec_id_mapping_t;
 
+// globals
+static const AVCodec *sprite_decoder_codec[VOD_CODEC_ID_COUNT];
 static const AVCodec *sprite_encoder_codec = NULL;
+
+static sprite_codec_id_mapping_t sprite_codec_mappings[] = {
+	{ VOD_CODEC_ID_AVC, AV_CODEC_ID_H264, "h264" },
+	{ VOD_CODEC_ID_HEVC, AV_CODEC_ID_H265, "h265" },
+	{ VOD_CODEC_ID_VP8, AV_CODEC_ID_VP8, "vp8" },
+	{ VOD_CODEC_ID_VP9, AV_CODEC_ID_VP9, "vp9" },
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(57, 89, 100)
+	{ VOD_CODEC_ID_AV1, AV_CODEC_ID_AV1, "av1" },
+#endif
+};
 
 void
 sprite_grabber_process_init(vod_log_t* log)
 {
-	// encoder init - reuse thumb's process init for decoder codecs
+	const AVCodec *cur_decoder;
+	sprite_codec_id_mapping_t* mapping_cur;
+	sprite_codec_id_mapping_t* mapping_end;
+
+	vod_memzero(sprite_decoder_codec, sizeof(sprite_decoder_codec));
+
 	sprite_encoder_codec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
 	if (sprite_encoder_codec == NULL)
 	{
 		vod_log_error(VOD_LOG_WARN, log, 0,
 			"sprite_grabber_process_init: failed to get jpeg encoder, sprite capture is disabled");
+		return;
+	}
+
+	mapping_end = sprite_codec_mappings + vod_array_entries(sprite_codec_mappings);
+	for (mapping_cur = sprite_codec_mappings; mapping_cur < mapping_end; mapping_cur++)
+	{
+		cur_decoder = avcodec_find_decoder(mapping_cur->av_codec_id);
+		if (cur_decoder == NULL)
+		{
+			vod_log_error(VOD_LOG_WARN, log, 0,
+				"sprite_grabber_process_init: failed to get %s decoder", mapping_cur->name);
+			continue;
+		}
+		sprite_decoder_codec[mapping_cur->codec_id] = cur_decoder;
 	}
 }
 
@@ -97,7 +131,7 @@ sprite_grabber_init_decoder(
 	AVCodecContext *dec;
 	int avrc;
 
-	dec = avcodec_alloc_context3(decoder_codec[media_info->codec_id]);
+	dec = avcodec_alloc_context3(sprite_decoder_codec[media_info->codec_id]);
 	if (dec == NULL)
 	{
 		vod_log_error(VOD_LOG_ERR, request_context->log, 0,
@@ -116,7 +150,7 @@ sprite_grabber_init_decoder(
 	dec->width = media_info->u.video.width;
 	dec->height = media_info->u.video.height;
 
-	avrc = avcodec_open2(dec, decoder_codec[media_info->codec_id], NULL);
+	avrc = avcodec_open2(dec, sprite_decoder_codec[media_info->codec_id], NULL);
 	if (avrc < 0)
 	{
 		vod_log_error(VOD_LOG_ERR, request_context->log, 0,
@@ -241,7 +275,7 @@ sprite_grabber_init_state(
 		return VOD_BAD_REQUEST;
 	}
 
-	if (decoder_codec[track->media_info.codec_id] == NULL)
+	if (sprite_decoder_codec[track->media_info.codec_id] == NULL)
 	{
 		vod_log_error(VOD_LOG_ERR, request_context->log, 0,
 			"sprite_grabber_init_state: no decoder for codec %uD", track->media_info.codec_id);

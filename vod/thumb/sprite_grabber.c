@@ -719,6 +719,9 @@ sprite_grabber_process(void* context)
 			pkt->size = state->frame_buffer_size;
 			pkt->flags = AV_PKT_FLAG_KEY;
 
+			// reset decoder state before each tile (required after EAGAIN flush)
+			avcodec_flush_buffers(state->decoder);
+
 			avrc = avcodec_send_packet(state->decoder, pkt);
 			av_packet_free(&pkt);
 

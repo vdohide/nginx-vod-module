@@ -1,5 +1,6 @@
 #include "sprite_grabber.h"
 #include "../media_set.h"
+#include "../codec_config.h"
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/imgutils.h>
@@ -45,6 +46,7 @@ typedef struct
 	AVCodecContext *decoder;
 	AVCodecContext *encoder;
 	AVFrame *decoded_frame;
+	AVFrame *working_frame;
 	AVPacket *output_packet;
 
 	// track info
@@ -60,6 +62,8 @@ typedef struct
 	void* frames_source_context;
 	input_frame_t* cur_keyframe;
 	uint64_t cur_keyframe_dts;
+	input_frame_t* last_decoded_keyframe;
+	uint64_t last_keyframe_dts;
 	u_char* frame_buffer;
 	uint32_t frame_buffer_size;
 	uint32_t max_frame_size;
@@ -124,6 +128,7 @@ sprite_grabber_free_state(void* context)
 	sprite_grabber_state_t* state = (sprite_grabber_state_t*)context;
 
 	av_packet_free(&state->output_packet);
+	av_frame_free(&state->working_frame);
 	av_frame_free(&state->decoded_frame);
 	if (state->encoder != NULL)
 	{
@@ -164,10 +169,23 @@ sprite_grabber_init_decoder(
 	dec->time_base.num = 1;
 	dec->time_base.den = media_info->frames_timescale;
 	dec->pkt_timebase = dec->time_base;
-	dec->extradata = media_info->extra_data.data;
-	dec->extradata_size = media_info->extra_data.len;
+	if (media_info->extra_data.len > 0)
+	{
+		dec->extradata = vod_alloc(
+			request_context->pool,
+			media_info->extra_data.len + AV_INPUT_BUFFER_PADDING_SIZE);
+		if (dec->extradata == NULL)
+		{
+			vod_log_error(VOD_LOG_ERR, request_context->log, 0,
+				"sprite_grabber_init_decoder: vod_alloc failed");
+			return VOD_ALLOC_FAILED;
+		}
+		vod_memcpy(dec->extradata, media_info->extra_data.data, media_info->extra_data.len);
+		dec->extradata_size = media_info->extra_data.len;
+	}
 	dec->width = media_info->u.video.width;
 	dec->height = media_info->u.video.height;
+	dec->thread_count = 1;
 
 	avrc = avcodec_open2(dec, sprite_decoder_codec[media_info->codec_id], NULL);
 	if (avrc < 0)
@@ -428,122 +446,337 @@ sprite_grabber_calc_encode_height(
 	return VOD_OK;
 }
 
-static vod_status_t
-sprite_grabber_prepare_decoder_for_tile(sprite_grabber_state_t* state)
+static uint32_t
+sprite_grabber_get_nal_length_size(
+	request_context_t* request_context,
+	media_info_t* media_info)
 {
-	avcodec_flush_buffers(state->decoder);
-	return VOD_OK;
+	vod_status_t rc;
+	uint32_t nal_length_size = 4;
+	vod_str_t dummy;
+
+	switch (media_info->codec_id)
+	{
+	case VOD_CODEC_ID_AVC:
+		rc = codec_config_avcc_get_nal_units(
+			request_context, &media_info->extra_data, TRUE, &nal_length_size, &dummy);
+		break;
+
+	case VOD_CODEC_ID_HEVC:
+		rc = codec_config_hevc_get_nal_units(
+			request_context, &media_info->extra_data, TRUE, &nal_length_size, &dummy);
+		break;
+
+	default:
+		return 4;
+	}
+
+	if (rc != VOD_OK || nal_length_size == 0)
+	{
+		return 4;
+	}
+
+	return nal_length_size;
+}
+
+static uint32_t
+sprite_grabber_read_nal_size(u_char* p, uint32_t nal_length_size)
+{
+	uint32_t result = 0;
+	uint32_t i;
+
+	for (i = 0; i < nal_length_size; i++)
+	{
+		result = (result << 8) | p[i];
+	}
+
+	return result;
+}
+
+static vod_status_t
+sprite_grabber_reset_decoder(sprite_grabber_state_t* state)
+{
+	if (state->decoder != NULL)
+	{
+		avcodec_close(state->decoder);
+		av_free(state->decoder);
+		state->decoder = NULL;
+	}
+
+	return sprite_grabber_init_decoder(
+		state->request_context, &state->track->media_info, &state->decoder);
 }
 
 static bool_t
-sprite_grabber_validate_decoded_frame(sprite_grabber_state_t* state)
+sprite_grabber_nal_is_vcl(uint32_t codec_id, uint8_t nal_type)
 {
-	AVFrame* frame = state->decoded_frame;
-
-	if (frame->width <= 0 || frame->height <= 0 ||
-		frame->width > 8192 || frame->height > 8192 ||
-		frame->data[0] == NULL)
+	switch (codec_id)
 	{
-		vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
-			"sprite_grabber_validate_decoded_frame: invalid frame %dx%d at tile %uD",
-			frame->width, frame->height, state->cur_tile);
+	case VOD_CODEC_ID_AVC:
+		return nal_type >= 1 && nal_type <= 5;
+
+	case VOD_CODEC_ID_HEVC:
+		return nal_type <= 31;
+
+	default:
 		return FALSE;
+	}
+}
+
+static bool_t
+sprite_grabber_vcl_is_safe_to_decode(uint32_t codec_id, uint8_t nal_type)
+{
+	switch (codec_id)
+	{
+	case VOD_CODEC_ID_AVC:
+		return nal_type == 5;
+
+	case VOD_CODEC_ID_HEVC:
+		return nal_type == 19 || nal_type == 20;
+
+	default:
+		return TRUE;
+	}
+}
+
+static bool_t
+sprite_grabber_frame_is_safe_to_decode(
+	request_context_t* request_context,
+	media_info_t* media_info,
+	u_char* buffer,
+	uint32_t size)
+{
+	uint32_t nal_length_size;
+	uint32_t cur = 0;
+	uint32_t nal_size;
+	uint8_t nal_type;
+
+	switch (media_info->codec_id)
+	{
+	case VOD_CODEC_ID_AVC:
+	case VOD_CODEC_ID_HEVC:
+		break;
+
+	default:
+		return TRUE;
+	}
+
+	nal_length_size = sprite_grabber_get_nal_length_size(request_context, media_info);
+
+	while (cur + nal_length_size <= size)
+	{
+		nal_size = sprite_grabber_read_nal_size(buffer + cur, nal_length_size);
+		cur += nal_length_size;
+
+		if (nal_size == 0 || cur + nal_size > size)
+		{
+			break;
+		}
+
+		switch (media_info->codec_id)
+		{
+		case VOD_CODEC_ID_AVC:
+			nal_type = buffer[cur] & 0x1f;
+			break;
+
+		case VOD_CODEC_ID_HEVC:
+			nal_type = (buffer[cur] >> 1) & 0x3f;
+			break;
+
+		default:
+			nal_type = 0;
+			break;
+		}
+
+		if (sprite_grabber_nal_is_vcl(media_info->codec_id, nal_type))
+		{
+			return sprite_grabber_vcl_is_safe_to_decode(
+				media_info->codec_id, nal_type);
+		}
+
+		cur += nal_size;
+	}
+
+	return FALSE;
+}
+
+static bool_t
+sprite_grabber_validate_frame(AVFrame* frame, vod_log_t* log, uint32_t cur_tile)
+{
+	if (frame == NULL ||
+		frame->width <= 0 || frame->height <= 0 ||
+		frame->width > 8192 || frame->height > 8192 ||
+		frame->data[0] == NULL || frame->linesize[0] < frame->width)
+	{
+		vod_log_error(VOD_LOG_WARN, log, 0,
+			"sprite_grabber_validate_frame: invalid frame %dx%d at tile %uD",
+			frame != NULL ? frame->width : 0,
+			frame != NULL ? frame->height : 0,
+			cur_tile);
+		return FALSE;
+	}
+
+	if (frame->format == AV_PIX_FMT_YUV420P ||
+		frame->format == AV_PIX_FMT_YUVJ420P)
+	{
+		if (frame->data[1] == NULL || frame->data[2] == NULL ||
+			frame->linesize[1] <= 0 || frame->linesize[2] <= 0)
+		{
+			vod_log_error(VOD_LOG_WARN, log, 0,
+				"sprite_grabber_validate_frame: missing YUV planes at tile %uD",
+				cur_tile);
+			return FALSE;
+		}
 	}
 
 	return TRUE;
 }
 
 static vod_status_t
-sprite_grabber_decode_tile(sprite_grabber_state_t* state)
+sprite_grabber_copy_to_working_frame(sprite_grabber_state_t* state)
 {
-	input_frame_t* frame = state->cur_keyframe;
-	AVPacket* pkt;
-	u_char* frame_end;
-	u_char original_pad[VOD_BUFFER_PADDING_SIZE];
+	AVFrame* src = state->decoded_frame;
+	AVFrame* dst = state->working_frame;
 	int avrc;
-	bool_t got_frame = FALSE;
 
-	if (frame == NULL)
-	{
-		return VOD_UNEXPECTED;
-	}
+	av_frame_unref(dst);
 
-	{
-		vod_status_t rc = sprite_grabber_prepare_decoder_for_tile(state);
-		if (rc != VOD_OK)
-		{
-			return rc;
-		}
-	}
+	dst->format = src->format;
+	dst->width = src->width;
+	dst->height = src->height;
 
-	av_frame_unref(state->decoded_frame);
-
-	pkt = av_packet_alloc();
-	if (pkt == NULL)
+	avrc = av_frame_get_buffer(dst, 32);
+	if (avrc < 0)
 	{
 		return VOD_ALLOC_FAILED;
 	}
 
-	frame_end = state->frame_buffer + state->frame_buffer_size;
-	vod_memcpy(original_pad, frame_end, sizeof(original_pad));
-	vod_memzero(frame_end, VOD_BUFFER_PADDING_SIZE);
-
-	pkt->data = state->frame_buffer;
-	pkt->size = state->frame_buffer_size;
-	pkt->dts = state->cur_keyframe_dts;
-	pkt->pts = state->cur_keyframe_dts + frame->pts_delay;
-	pkt->duration = frame->duration;
-	pkt->flags = frame->key_frame ? AV_PKT_FLAG_KEY : 0;
-
-	avrc = avcodec_send_packet(state->decoder, pkt);
-	av_packet_free(&pkt);
-
-	vod_memcpy(frame_end, original_pad, sizeof(original_pad));
-
+	avrc = av_frame_copy(dst, src);
 	if (avrc < 0)
 	{
-		vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
-			"sprite_grabber_decode_tile: avcodec_send_packet failed %d at tile %uD",
-			avrc, state->cur_tile);
 		return VOD_UNEXPECTED;
 	}
 
-	for (;;)
-	{
-		avrc = avcodec_receive_frame(state->decoder, state->decoded_frame);
-		if (avrc == 0)
-		{
-			got_frame = TRUE;
-			break;
-		}
-		if (avrc == AVERROR(EAGAIN) || avrc == AVERROR_EOF)
-		{
-			break;
-		}
+	av_frame_copy_props(dst, src);
 
+	return VOD_OK;
+}
+
+static vod_status_t
+sprite_grabber_decode_tile(sprite_grabber_state_t* state)
+{
+	input_frame_t* frame = state->cur_keyframe;
+	media_info_t* media_info = &state->track->media_info;
+	AVPacket* input_packet;
+	int avrc;
+	vod_status_t rc;
+	uint32_t tile_offset_ms;
+
+	if (frame == NULL || frame->size == 0)
+	{
+		return VOD_UNEXPECTED;
+	}
+
+	tile_offset_ms = state->page * state->total_tiles * state->interval_ms +
+		state->cur_tile * state->interval_ms;
+
+	if (state->frame_buffer_size != frame->size)
+	{
+		vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+			"sprite_grabber_decode_tile: read size %uD != frame size %uD at tile %uD",
+			state->frame_buffer_size, frame->size, state->cur_tile);
+		return VOD_UNEXPECTED;
+	}
+
+	if (state->cur_keyframe == state->last_decoded_keyframe &&
+		sprite_grabber_validate_frame(
+			state->working_frame, state->request_context->log, state->cur_tile))
+	{
+		return VOD_OK;
+	}
+
+	if (frame->key_frame &&
+		!sprite_grabber_frame_is_safe_to_decode(
+			state->request_context, media_info,
+			state->frame_buffer, frame->size))
+	{
+		vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+			"sprite_grabber_decode_tile: unsafe keyframe at tile %uD offset %uD ms, skipping",
+			state->cur_tile, tile_offset_ms);
+		return VOD_UNEXPECTED;
+	}
+
+	rc = sprite_grabber_reset_decoder(state);
+	if (rc != VOD_OK)
+	{
+		return rc;
+	}
+
+	input_packet = av_packet_alloc();
+	if (input_packet == NULL)
+	{
+		return VOD_ALLOC_FAILED;
+	}
+
+	avrc = av_new_packet(input_packet, frame->size);
+	if (avrc < 0)
+	{
+		av_packet_free(&input_packet);
+		return VOD_ALLOC_FAILED;
+	}
+
+	vod_memcpy(input_packet->data, state->frame_buffer, frame->size);
+
+	input_packet->dts = state->cur_keyframe_dts;
+	input_packet->pts = state->cur_keyframe_dts + frame->pts_delay;
+	input_packet->duration = frame->duration;
+	input_packet->flags = frame->key_frame ? AV_PKT_FLAG_KEY : 0;
+
+	av_frame_unref(state->decoded_frame);
+
+	avrc = avcodec_send_packet(state->decoder, input_packet);
+	av_packet_free(&input_packet);
+	if (avrc < 0)
+	{
+		vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+			"sprite_grabber_decode_tile: avcodec_send_packet failed %d at tile %uD offset %uD ms",
+			avrc, state->cur_tile, tile_offset_ms);
+		return VOD_UNEXPECTED;
+	}
+
+	avrc = avcodec_receive_frame(state->decoder, state->decoded_frame);
+	if (avrc == AVERROR(EAGAIN))
+	{
+		vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+			"sprite_grabber_decode_tile: avcodec_receive_frame needs more input at tile %uD, skipping",
+			state->cur_tile);
+		return VOD_UNEXPECTED;
+	}
+	else if (avrc < 0)
+	{
 		vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
 			"sprite_grabber_decode_tile: avcodec_receive_frame failed %d at tile %uD",
 			avrc, state->cur_tile);
 		return VOD_UNEXPECTED;
 	}
 
-	if (!got_frame)
-	{
-		avrc = avcodec_send_packet(state->decoder, NULL);
-		if (avrc >= 0)
-		{
-			avrc = avcodec_receive_frame(state->decoder, state->decoded_frame);
-			if (avrc == 0)
-			{
-				got_frame = TRUE;
-			}
-		}
-	}
-
-	if (!got_frame || !sprite_grabber_validate_decoded_frame(state))
+	if (!sprite_grabber_validate_frame(
+		state->decoded_frame, state->request_context->log, state->cur_tile))
 	{
 		return VOD_UNEXPECTED;
 	}
+
+	rc = sprite_grabber_copy_to_working_frame(state);
+	if (rc != VOD_OK)
+	{
+		vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+			"sprite_grabber_decode_tile: copy_to_working_frame failed at tile %uD",
+			state->cur_tile);
+		return rc;
+	}
+
+	state->last_decoded_keyframe = state->cur_keyframe;
+	state->last_keyframe_dts = state->cur_keyframe_dts;
 
 	return VOD_OK;
 }
@@ -628,10 +861,22 @@ sprite_grabber_resize_and_place(
 	uint32_t row)
 {
 	struct SwsContext *sws_ctx;
-	AVFrame* input_frame = state->decoded_frame;
+	AVFrame* input_frame = state->working_frame;
 	uint8_t* tile_data[4];
 	int tile_linesize[4];
 	uint32_t x_offset, y_offset;
+
+	x_offset = col * state->tile_width;
+	y_offset = row * state->tile_height;
+
+	if (x_offset + state->tile_width > state->canvas_width ||
+		y_offset + state->tile_height > state->canvas_height)
+	{
+		vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+			"sprite_grabber_resize_and_place: tile %uD at (%uD,%uD) exceeds canvas %ux%u",
+			state->cur_tile, col, row, state->canvas_width, state->canvas_height);
+		return VOD_UNEXPECTED;
+	}
 
 	if (input_frame->width <= 0 || input_frame->height <= 0)
 	{
@@ -674,9 +919,6 @@ sprite_grabber_resize_and_place(
 		sws_freeContext(sws_ctx);
 
 		// copy tile pixels into canvas at (col, row) position
-		x_offset = col * state->tile_width;
-		y_offset = row * state->tile_height;
-
 		// Y plane
 		for (y = 0; y < state->tile_height; y++)
 		{
@@ -713,7 +955,7 @@ sprite_grabber_resize_and_place(
 #endif // VOD_HAVE_LIB_SW_SCALE
 
 static uint32_t
-sprite_grabber_get_max_keyframe_size(media_track_t* track)
+sprite_grabber_get_max_frame_size(media_track_t* track)
 {
 	frame_list_part_t* part;
 	input_frame_t* cur_frame;
@@ -745,7 +987,7 @@ sprite_grabber_get_max_keyframe_size(media_track_t* track)
 			}
 		}
 
-		if (cur_frame->key_frame && cur_frame->size > max_frame_size)
+		if (cur_frame->size > max_frame_size)
 		{
 			max_frame_size = cur_frame->size;
 		}
@@ -897,12 +1139,23 @@ sprite_grabber_init_state(
 		return rc;
 	}
 
-	// alloc decoded frame
+	// alloc decoded/working frames
 	state->decoded_frame = av_frame_alloc();
 	if (state->decoded_frame == NULL)
 	{
 		return VOD_ALLOC_FAILED;
 	}
+
+	state->working_frame = av_frame_alloc();
+	if (state->working_frame == NULL)
+	{
+		return VOD_ALLOC_FAILED;
+	}
+
+	vod_log_error(VOD_LOG_ERR, request_context->log, 0,
+		"sprite_grabber_init_state: page=%uD canvas=%ux%u encode_height=%uD duration_ms=%uL",
+		page + 1, state->canvas_width, state->canvas_height,
+		state->encode_height, (unsigned long)state->video_duration_ms);
 
 	state->output_packet = av_packet_alloc();
 	if (state->output_packet == NULL)
@@ -948,8 +1201,8 @@ sprite_grabber_init_state(
 		return VOD_UNEXPECTED;
 	}
 
-	// find max keyframe size across the entire track for buffer allocation
-	max_frame_size = sprite_grabber_get_max_keyframe_size(track);
+	// find max frame size across the entire track for buffer allocation
+	max_frame_size = sprite_grabber_get_max_frame_size(track);
 	if (max_frame_size == 0)
 	{
 		max_frame_size = 256 * 1024;  // 256KB fallback

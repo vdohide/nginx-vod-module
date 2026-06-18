@@ -1329,7 +1329,10 @@ sprite_grabber_process(void* context)
 
 			if (!frame_done)
 			{
-				return VOD_AGAIN;  // need more data from framework
+				// partial read: the frame spans multiple cache buffers,
+				// keep reading the next chunk (like thumb_grabber). Only the
+				// frames_source returning VOD_AGAIN should bubble up.
+				continue;
 			}
 
 			vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,

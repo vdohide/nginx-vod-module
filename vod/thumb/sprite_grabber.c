@@ -265,7 +265,10 @@ sprite_grabber_find_keyframe_at(
 
 	*out_part = best_part;
 	*out_frame = best_frame;
-	*out_frame_size = best_frame->size;
+	if (out_frame_size != NULL)
+	{
+		*out_frame_size = best_frame->size;
+	}
 	if (out_keyframe_dts != NULL)
 	{
 		*out_keyframe_dts = best_dts;
@@ -352,6 +355,43 @@ sprite_grabber_get_track_duration_ms(media_track_t* track)
 	}
 
 	return duration_ms;
+}
+
+void
+sprite_grabber_calc_tile_dims(
+	uint32_t video_width,
+	uint32_t video_height,
+	uint32_t* tile_width,
+	uint32_t* tile_height)
+{
+	uint32_t tw = *tile_width;
+	uint32_t th = *tile_height;
+
+	// height-primary: when only the height is known, derive the width from the
+	// source aspect ratio so portrait/landscape videos share the same tile
+	// height (width varies). Width-primary is kept as a fallback for explicit
+	// width requests.
+	if (th > 0 && tw == 0 && video_height > 0)
+	{
+		tw = (uint32_t)(((uint64_t)video_width * th) / video_height);
+	}
+	else if (tw > 0 && th == 0 && video_width > 0)
+	{
+		th = (uint32_t)(((uint64_t)video_height * tw) / video_width);
+	}
+
+	if (tw == 0)
+	{
+		tw = SPRITE_DEFAULT_TILE_WIDTH;
+	}
+	if (th == 0)
+	{
+		th = SPRITE_DEFAULT_TILE_HEIGHT;
+	}
+
+	// dimensions must be even for YUV420P
+	*tile_width = (tw + 1) & ~1u;
+	*tile_height = (th + 1) & ~1u;
 }
 
 uint32_t
@@ -680,20 +720,12 @@ sprite_grabber_decode_tile(sprite_grabber_state_t* state)
 		return VOD_UNEXPECTED;
 	}
 
-	vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-		"sprite_grabber_decode_tile: STAGE tile-top tile=%uD reuse=%uD",
-		state->cur_tile,
-		(uint32_t)(state->cur_keyframe == state->last_decoded_keyframe));
-
 	if (state->cur_keyframe == state->last_decoded_keyframe &&
 		sprite_grabber_validate_frame(
 			state->working_frame, state->request_context->log, state->cur_tile))
 	{
 		return VOD_OK;
 	}
-
-	vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-		"sprite_grabber_decode_tile: STAGE idr-check tile=%uD", state->cur_tile);
 
 	if (frame->key_frame &&
 		!sprite_grabber_frame_is_safe_to_decode(
@@ -705,11 +737,6 @@ sprite_grabber_decode_tile(sprite_grabber_state_t* state)
 			state->cur_tile, tile_offset_ms);
 		return VOD_UNEXPECTED;
 	}
-
-	vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-		"sprite_grabber_decode_tile: STAGE decode-enter tile=%uD offset=%uD ms size=%uD key=%uD dts=%uL",
-		state->cur_tile, tile_offset_ms, frame->size,
-		(uint32_t)frame->key_frame, state->cur_keyframe_dts);
 
 	// reset decoder state before decoding this independent keyframe
 	avcodec_flush_buffers(state->decoder);
@@ -776,11 +803,6 @@ sprite_grabber_decode_tile(sprite_grabber_state_t* state)
 		return VOD_UNEXPECTED;
 	}
 
-	vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-		"sprite_grabber_decode_tile: STAGE decode-ok tile=%uD %dx%d fmt=%d",
-		state->cur_tile, state->decoded_frame->width,
-		state->decoded_frame->height, state->decoded_frame->format);
-
 	rc = sprite_grabber_copy_to_working_frame(state);
 	if (rc != VOD_OK)
 	{
@@ -804,7 +826,6 @@ sprite_grabber_start_next_tile(sprite_grabber_state_t* state)
 	uint32_t frame_offset_ms;
 	frame_list_part_t* part;
 	input_frame_t* frame;
-	uint32_t frame_size;
 	uint64_t keyframe_dts;
 	vod_status_t rc;
 
@@ -834,7 +855,7 @@ sprite_grabber_start_next_tile(sprite_grabber_state_t* state)
 			state->track->media_info.frames_timescale,
 			&part,
 			&frame,
-			&frame_size,
+			NULL,
 			&keyframe_dts);
 		if (rc != VOD_OK)
 		{
@@ -844,10 +865,6 @@ sprite_grabber_start_next_tile(sprite_grabber_state_t* state)
 
 		state->cur_keyframe = frame;
 		state->cur_keyframe_dts = keyframe_dts;
-
-		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-			"sprite_grabber_start_next_tile: STAGE next-found tile=%uD off=%uD kf_size=%uD",
-			state->cur_tile, frame_offset_ms, frame_size);
 
 		// set up reading from this frame's source
 		state->frames_source = part->frames_source;
@@ -864,10 +881,6 @@ sprite_grabber_start_next_tile(sprite_grabber_state_t* state)
 			state->cur_tile++;
 			continue;
 		}
-
-		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-			"sprite_grabber_start_next_tile: STAGE start-frame-ok tile=%uD offset=%uL size=%uD max_buf=%uD",
-			state->cur_tile, frame->offset, frame->size, state->max_frame_size);
 
 		state->frame_buffer_size = 0;
 		state->cur_state = SPRITE_STATE_READ_FRAME;
@@ -908,12 +921,6 @@ sprite_grabber_resize_and_place(
 		return VOD_UNEXPECTED;
 	}
 
-	vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-		"sprite_grabber_resize_and_place: STAGE resize-enter tile=%uD in=%dx%d fmt=%d ls0=%d ls1=%d ls2=%d -> tile=%uDx%uD",
-		state->cur_tile, input_frame->width, input_frame->height, input_frame->format,
-		input_frame->linesize[0], input_frame->linesize[1], input_frame->linesize[2],
-		state->tile_width, state->tile_height);
-
 	sws_ctx = sws_getContext(
 		input_frame->width, input_frame->height, input_frame->format,
 		state->tile_width, state->tile_height, AV_PIX_FMT_YUV420P,
@@ -945,9 +952,6 @@ sprite_grabber_resize_and_place(
 			tile_data, tile_linesize);
 
 		sws_freeContext(sws_ctx);
-
-		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-			"sprite_grabber_resize_and_place: STAGE scale-done tile=%uD", state->cur_tile);
 
 		// copy tile pixels into canvas at (col, row) position
 		// Y plane
@@ -1032,10 +1036,6 @@ sprite_grabber_encode_canvas(sprite_grabber_state_t* state)
 {
 	AVFrame* canvas_frame;
 	int avrc;
-
-	vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-		"sprite_grabber_encode_canvas: STAGE encode-enter w=%uD h=%uD",
-		state->canvas_width, state->encode_height);
 
 	canvas_frame = av_frame_alloc();
 	if (canvas_frame == NULL)
@@ -1125,16 +1125,13 @@ sprite_grabber_init_state(
 	cln->handler = sprite_grabber_free_state;
 	cln->data = state;
 
-	// calculate tile dimensions
-	if (tile_height == 0 && track->media_info.u.video.width > 0)
-	{
-		tile_height = ((uint64_t)track->media_info.u.video.height * tile_width) /
-			track->media_info.u.video.width;
-	}
-
-	// ensure dimensions are even (required for YUV420P)
-	tile_width = (tile_width + 1) & ~1;
-	tile_height = (tile_height + 1) & ~1;
+	// derive tile dimensions (height-primary: fixed height, width from aspect
+	// ratio) and round to even values for YUV420P
+	sprite_grabber_calc_tile_dims(
+		track->media_info.u.video.width,
+		track->media_info.u.video.height,
+		&tile_width,
+		&tile_height);
 
 	state->request_context = request_context;
 	state->write_callback = write_callback;
@@ -1187,7 +1184,7 @@ sprite_grabber_init_state(
 		return VOD_ALLOC_FAILED;
 	}
 
-	vod_log_error(VOD_LOG_ERR, request_context->log, 0,
+	vod_log_debug6(VOD_LOG_DEBUG_LEVEL, request_context->log, 0,
 		"sprite_grabber_init_state: page=%uD canvas_w=%uD canvas_h=%uD encode_height=%uD duration_ms=%uL codec=%uD",
 		(uint32_t)(page + 1), state->canvas_width, state->canvas_height,
 		state->encode_height, state->video_duration_ms,
@@ -1304,10 +1301,6 @@ sprite_grabber_process(void* context)
 				continue;
 			}
 
-			vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-				"sprite_grabber_process: STAGE read-chunk tile=%uD size=%uD done=%uD accum=%uD",
-				state->cur_tile, read_size, (uint32_t)frame_done, state->frame_buffer_size);
-
 			// accumulate data in frame buffer
 			if (state->frame_buffer_size + read_size > state->max_frame_size)
 			{
@@ -1334,10 +1327,6 @@ sprite_grabber_process(void* context)
 				// frames_source returning VOD_AGAIN should bubble up.
 				continue;
 			}
-
-			vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-				"sprite_grabber_process: STAGE read-done tile=%uD accum=%uD",
-				state->cur_tile, state->frame_buffer_size);
 
 			state->cur_state = SPRITE_STATE_DECODE;
 			/* fall through */
@@ -1376,9 +1365,6 @@ sprite_grabber_process(void* context)
 				"sprite_grabber_process: libswscale is required for sprite generation");
 			return VOD_BAD_REQUEST;
 #endif
-
-			vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-				"sprite_grabber_process: STAGE place-done tile=%uD", state->cur_tile);
 
 			// advance to next tile
 			state->cur_tile++;

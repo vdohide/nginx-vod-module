@@ -6,16 +6,23 @@
 #include "../media_set.h"
 
 // constants
-#define SPRITE_DEFAULT_COLS       (6)
-#define SPRITE_DEFAULT_ROWS       (6)
-#define SPRITE_DEFAULT_INTERVAL   (1000)    // ms between frames
-#define SPRITE_DEFAULT_TILE_WIDTH (160)
-#define SPRITE_DEFAULT_QUALITY    (75)
+#define SPRITE_DEFAULT_COLS        (6)
+#define SPRITE_DEFAULT_ROWS        (6)
+#define SPRITE_DEFAULT_INTERVAL    (1000)    // ms between frames
+#define SPRITE_DEFAULT_TILE_WIDTH  (160)     // fallback only (height-primary by default)
+#define SPRITE_DEFAULT_TILE_HEIGHT (160)     // fixed tile height; width derived from aspect ratio
+#define SPRITE_DEFAULT_QUALITY     (75)
 
 // functions
 void sprite_grabber_process_init(vod_log_t* log);
 
 uint64_t sprite_grabber_get_track_duration_ms(media_track_t* track);
+
+void sprite_grabber_calc_tile_dims(
+	uint32_t video_width,
+	uint32_t video_height,
+	uint32_t* tile_width,
+	uint32_t* tile_height);
 
 uint32_t sprite_grabber_get_total_content_tiles(
 	uint64_t duration_ms,

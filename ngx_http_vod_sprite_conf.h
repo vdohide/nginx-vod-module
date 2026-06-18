@@ -11,7 +11,8 @@ typedef struct
 	ngx_uint_t cols;
 	ngx_uint_t rows;
 	ngx_uint_t interval;        // ms between frames
-	ngx_uint_t tile_width;      // px, height auto-calculated
+	ngx_uint_t tile_width;      // px, 0 = auto-derive from height (aspect ratio)
+	ngx_uint_t tile_height;     // px, fixed tile height; width derived from aspect ratio
 } ngx_http_vod_sprite_loc_conf_t;
 
 #endif // _NGX_HTTP_VOD_SPRITE_CONF_H_INCLUDED_

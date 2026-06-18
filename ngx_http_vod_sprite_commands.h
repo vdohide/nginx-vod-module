@@ -35,4 +35,11 @@
 	BASE_OFFSET + offsetof(ngx_http_vod_sprite_loc_conf_t, tile_width),
 	NULL },
 
+	{ ngx_string("vod_sprite_tile_height"),
+	NGX_HTTP_MAIN_CONF | NGX_HTTP_SRV_CONF | NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+	ngx_conf_set_num_slot,
+	NGX_HTTP_LOC_CONF_OFFSET,
+	BASE_OFFSET + offsetof(ngx_http_vod_sprite_loc_conf_t, tile_height),
+	NULL },
+
 #undef BASE_OFFSET

@@ -32,7 +32,7 @@ ngx_http_vod_sprite_handle_metadata(
 	uint32_t rows = conf->sprite.rows;
 	uint32_t interval_ms = conf->sprite.interval;
 	uint32_t tile_width = conf->sprite.tile_width;
-	uint32_t tile_height;
+	uint32_t tile_height = conf->sprite.tile_height;
 	uint32_t tiles_per_page = cols * rows;
 	uint32_t total_tiles;
 	uint32_t tile_idx;
@@ -65,17 +65,12 @@ ngx_http_vod_sprite_handle_metadata(
 	}
 	duration_ms = (total_duration * 1000) / track->media_info.frames_timescale;
 
-	// calculate tile height from aspect ratio
-	if (track->media_info.u.video.width > 0)
-	{
-		tile_height = ((uint64_t)track->media_info.u.video.height * tile_width) /
-			track->media_info.u.video.width;
-		tile_height = (tile_height + 1) & ~1;
-	}
-	else
-	{
-		tile_height = 90;
-	}
+	// derive tile dimensions (height-primary: fixed height, width from aspect ratio)
+	sprite_grabber_calc_tile_dims(
+		track->media_info.u.video.width,
+		track->media_info.u.video.height,
+		&tile_width,
+		&tile_height);
 
 	total_tiles = (uint32_t)((duration_ms + interval_ms - 1) / interval_ms);
 
@@ -183,10 +178,7 @@ ngx_http_vod_sprite_init_frame_processor(
 	}
 
 	tile_width = request_params->width > 0 ? request_params->width : conf->sprite.tile_width;
-	if (request_params->height > 0)
-	{
-		tile_height = request_params->height;
-	}
+	tile_height = request_params->height > 0 ? request_params->height : conf->sprite.tile_height;
 
 	rc = sprite_grabber_init_state(
 		&submodule_context->request_context,
@@ -246,6 +238,7 @@ ngx_http_vod_sprite_create_loc_conf(
 	conf->rows = NGX_CONF_UNSET_UINT;
 	conf->interval = NGX_CONF_UNSET_UINT;
 	conf->tile_width = NGX_CONF_UNSET_UINT;
+	conf->tile_height = NGX_CONF_UNSET_UINT;
 }
 
 static char *
@@ -259,7 +252,9 @@ ngx_http_vod_sprite_merge_loc_conf(
 	ngx_conf_merge_uint_value(conf->cols, prev->cols, SPRITE_DEFAULT_COLS);
 	ngx_conf_merge_uint_value(conf->rows, prev->rows, SPRITE_DEFAULT_ROWS);
 	ngx_conf_merge_uint_value(conf->interval, prev->interval, SPRITE_DEFAULT_INTERVAL);
-	ngx_conf_merge_uint_value(conf->tile_width, prev->tile_width, SPRITE_DEFAULT_TILE_WIDTH);
+	// width default 0 = auto-derive from height (height-primary)
+	ngx_conf_merge_uint_value(conf->tile_width, prev->tile_width, 0);
+	ngx_conf_merge_uint_value(conf->tile_height, prev->tile_height, SPRITE_DEFAULT_TILE_HEIGHT);
 	return NGX_CONF_OK;
 }
 

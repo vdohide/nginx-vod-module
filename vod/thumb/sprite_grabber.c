@@ -865,6 +865,9 @@ sprite_grabber_start_next_tile(sprite_grabber_state_t* state)
 			continue;
 		}
 
+		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+			"sprite_grabber_start_next_tile: STAGE start-frame-ok tile=%uD offset=%uL size=%uD max_buf=%uD",
+			state->cur_tile, frame->offset, frame->size, state->max_frame_size);
 
 		state->frame_buffer_size = 0;
 		state->cur_state = SPRITE_STATE_READ_FRAME;
@@ -1300,6 +1303,10 @@ sprite_grabber_process(void* context)
 				}
 				continue;
 			}
+
+			vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+				"sprite_grabber_process: STAGE read-chunk tile=%uD size=%uD done=%uD accum=%uD",
+				state->cur_tile, read_size, (uint32_t)frame_done, state->frame_buffer_size);
 
 			// accumulate data in frame buffer
 			if (state->frame_buffer_size + read_size > state->max_frame_size)

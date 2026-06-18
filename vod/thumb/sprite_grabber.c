@@ -8,6 +8,14 @@
 #include <libswscale/swscale.h>
 #endif // VOD_HAVE_LIB_SW_SCALE
 
+// state machine states
+enum {
+	SPRITE_STATE_READ_FRAME,
+	SPRITE_STATE_DECODE,
+	SPRITE_STATE_RESIZE_PLACE,
+	SPRITE_STATE_ENCODE,
+};
+
 // typedefs
 typedef struct
 {
@@ -41,8 +49,15 @@ typedef struct
 	media_track_t* track;
 	uint64_t video_duration_ms;
 
-	// tile processing state
+	// state machine
+	int cur_state;
 	uint32_t cur_tile;
+
+	// frame reading (like thumb_grabber)
+	frames_source_t* frames_source;
+	void* frames_source_context;
+	u_char* frame_buffer;
+	uint32_t frame_buffer_size;
 
 } sprite_grabber_state_t;
 
@@ -249,264 +264,70 @@ sprite_grabber_get_duration_ms(media_track_t* track, uint32_t timescale)
 	return (total_duration * 1000) / timescale;
 }
 
-vod_status_t
-sprite_grabber_init_state(
-	request_context_t* request_context,
-	media_track_t* track,
-	uint32_t page,
-	uint32_t tile_width,
-	uint32_t tile_height,
-	uint32_t cols,
-	uint32_t rows,
-	uint32_t interval_ms,
-	write_callback_t write_callback,
-	void* write_context,
-	void** result)
-{
-	sprite_grabber_state_t* state;
-	vod_pool_cleanup_t *cln;
-	vod_status_t rc;
-	int avrc;
-
-	if (sprite_encoder_codec == NULL)
-	{
-		vod_log_error(VOD_LOG_ERR, request_context->log, 0,
-			"sprite_grabber_init_state: jpeg encoder not available");
-		return VOD_BAD_REQUEST;
-	}
-
-	if (sprite_decoder_codec[track->media_info.codec_id] == NULL)
-	{
-		vod_log_error(VOD_LOG_ERR, request_context->log, 0,
-			"sprite_grabber_init_state: no decoder for codec %uD", track->media_info.codec_id);
-		return VOD_BAD_REQUEST;
-	}
-
-	state = vod_alloc(request_context->pool, sizeof(*state));
-	if (state == NULL)
-	{
-		return VOD_ALLOC_FAILED;
-	}
-
-	vod_memzero(state, sizeof(*state));
-
-	// add cleanup handler
-	cln = vod_pool_cleanup_add(request_context->pool, 0);
-	if (cln == NULL)
-	{
-		return VOD_ALLOC_FAILED;
-	}
-	cln->handler = sprite_grabber_free_state;
-	cln->data = state;
-
-	// calculate tile dimensions
-	if (tile_height == 0 && track->media_info.u.video.width > 0)
-	{
-		tile_height = ((uint64_t)track->media_info.u.video.height * tile_width) /
-			track->media_info.u.video.width;
-	}
-
-	// ensure dimensions are even (required for YUV420P)
-	tile_width = (tile_width + 1) & ~1;
-	tile_height = (tile_height + 1) & ~1;
-
-	state->request_context = request_context;
-	state->write_callback = write_callback;
-	state->write_context = write_context;
-	state->track = track;
-	state->cols = cols;
-	state->rows = rows;
-	state->tile_width = tile_width;
-	state->tile_height = tile_height;
-	state->canvas_width = tile_width * cols;
-	state->canvas_height = tile_height * rows;
-	state->interval_ms = interval_ms;
-	state->page = page;
-	state->total_tiles = cols * rows;
-	state->cur_tile = 0;
-
-	// get video duration
-	state->video_duration_ms = sprite_grabber_get_duration_ms(track, 
-		track->media_info.frames_timescale);
-
-	// init decoder
-	rc = sprite_grabber_init_decoder(request_context, &track->media_info, &state->decoder);
-	if (rc != VOD_OK)
-	{
-		return rc;
-	}
-
-	// alloc decoded frame
-	state->decoded_frame = av_frame_alloc();
-	if (state->decoded_frame == NULL)
-	{
-		return VOD_ALLOC_FAILED;
-	}
-
-	state->output_packet = av_packet_alloc();
-	if (state->output_packet == NULL)
-	{
-		return VOD_ALLOC_FAILED;
-	}
-
-	// allocate canvas (YUV420P)
-	avrc = av_image_alloc(
-		state->canvas_data, state->canvas_linesize,
-		state->canvas_width, state->canvas_height,
-		AV_PIX_FMT_YUV420P, 16);
-	if (avrc < 0)
-	{
-		vod_log_error(VOD_LOG_ERR, request_context->log, 0,
-			"sprite_grabber_init_state: av_image_alloc failed for canvas %ux%u",
-			state->canvas_width, state->canvas_height);
-		return VOD_ALLOC_FAILED;
-	}
-
-	// fill canvas with black (Y=0, U=128, V=128)
-	memset(state->canvas_data[0], 0, state->canvas_linesize[0] * state->canvas_height);
-	memset(state->canvas_data[1], 128, state->canvas_linesize[1] * (state->canvas_height / 2));
-	memset(state->canvas_data[2], 128, state->canvas_linesize[2] * (state->canvas_height / 2));
-
-	// init encoder for full canvas
-	state->encoder = avcodec_alloc_context3(sprite_encoder_codec);
-	if (state->encoder == NULL)
-	{
-		return VOD_ALLOC_FAILED;
-	}
-
-	state->encoder->width = state->canvas_width;
-	state->encoder->height = state->canvas_height;
-	state->encoder->time_base = (AVRational){ 1, 1 };
-	state->encoder->pix_fmt = AV_PIX_FMT_YUVJ420P;
-
-	avrc = avcodec_open2(state->encoder, sprite_encoder_codec, NULL);
-	if (avrc < 0)
-	{
-		vod_log_error(VOD_LOG_ERR, request_context->log, 0,
-			"sprite_grabber_init_state: avcodec_open2 encoder failed %d", avrc);
-		return VOD_UNEXPECTED;
-	}
-
-	*result = state;
-	return VOD_OK;
-}
-
+// advance to the next valid tile, find its keyframe, and start reading it
 static vod_status_t
-sprite_grabber_decode_keyframe(
-	sprite_grabber_state_t* state,
-	uint64_t target_time_ms)
+sprite_grabber_start_next_tile(sprite_grabber_state_t* state)
 {
+	uint32_t base_offset_ms;
+	uint32_t frame_offset_ms;
 	frame_list_part_t* part;
 	input_frame_t* frame;
 	uint32_t frame_size;
-	uint8_t* buffer;
-	uint8_t* frame_end;
-	uint8_t original_pad[VOD_BUFFER_PADDING_SIZE];
-	AVPacket* input_packet;
-	int avrc;
 	vod_status_t rc;
 
-	rc = sprite_grabber_find_keyframe_at(
-		state->track,
-		target_time_ms,
-		state->track->media_info.frames_timescale,
-		&part,
-		&frame,
-		&frame_size);
+	base_offset_ms = state->page * state->total_tiles * state->interval_ms;
 
-	if (rc != VOD_OK)
+	for (;;)
 	{
-		return rc;
-	}
-
-	// read the frame data
-	rc = part->frames_source->start_frame(
-		part->frames_source_context,
-		frame,
-		NULL);
-	if (rc != VOD_OK)
-	{
-		return rc;
-	}
-
-	// allocate buffer for frame data
-	buffer = vod_alloc(state->request_context->pool, frame_size + VOD_BUFFER_PADDING_SIZE);
-	if (buffer == NULL)
-	{
-		return VOD_ALLOC_FAILED;
-	}
-
-	// read frame data
-	{
-		uint32_t total_read = 0;
-		for (;;)
+		if (state->cur_tile >= state->total_tiles)
 		{
-			uint8_t* read_buffer;
-			uint32_t read_size;
-			bool_t frame_done;
-
-			rc = part->frames_source->read(
-				part->frames_source_context,
-				&read_buffer,
-				&read_size,
-				&frame_done);
-			if (rc != VOD_OK)
-			{
-				if (rc == VOD_AGAIN)
-				{
-					continue;
-				}
-				return rc;
-			}
-
-			vod_memcpy(buffer + total_read, read_buffer, read_size);
-			total_read += read_size;
-
-			if (frame_done)
-			{
-				break;
-			}
+			// no more tiles, go to encode
+			state->cur_state = SPRITE_STATE_ENCODE;
+			return VOD_OK;
 		}
+
+		frame_offset_ms = base_offset_ms + state->cur_tile * state->interval_ms;
+
+		if (frame_offset_ms >= state->video_duration_ms)
+		{
+			// beyond video, skip
+			state->cur_tile++;
+			continue;
+		}
+
+		rc = sprite_grabber_find_keyframe_at(
+			state->track,
+			frame_offset_ms,
+			state->track->media_info.frames_timescale,
+			&part,
+			&frame,
+			&frame_size);
+		if (rc != VOD_OK)
+		{
+			state->cur_tile++;
+			continue;
+		}
+
+		// set up reading from this frame's source
+		state->frames_source = part->frames_source;
+		state->frames_source_context = part->frames_source_context;
+
+		rc = state->frames_source->start_frame(
+			state->frames_source_context,
+			frame,
+			NULL);
+		if (rc != VOD_OK)
+		{
+			vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+				"sprite_grabber_start_next_tile: start_frame failed %i at tile %uD", rc, state->cur_tile);
+			state->cur_tile++;
+			continue;
+		}
+
+		state->frame_buffer_size = 0;
+		state->cur_state = SPRITE_STATE_READ_FRAME;
+		return VOD_OK;
 	}
-
-	// decode frame
-	av_frame_unref(state->decoded_frame);
-
-	frame_end = buffer + frame_size;
-	vod_memcpy(original_pad, frame_end, sizeof(original_pad));
-	vod_memzero(frame_end, sizeof(original_pad));
-
-	input_packet = av_packet_alloc();
-	if (input_packet == NULL)
-	{
-		return VOD_ALLOC_FAILED;
-	}
-
-	input_packet->data = buffer;
-	input_packet->size = frame_size;
-	input_packet->flags = AV_PKT_FLAG_KEY;
-
-	avrc = avcodec_send_packet(state->decoder, input_packet);
-	av_packet_free(&input_packet);
-	if (avrc < 0)
-	{
-		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-			"sprite_grabber_decode_keyframe: avcodec_send_packet failed %d", avrc);
-		vod_memcpy(frame_end, original_pad, sizeof(original_pad));
-		return VOD_BAD_DATA;
-	}
-
-	avrc = avcodec_receive_frame(state->decoder, state->decoded_frame);
-	vod_memcpy(frame_end, original_pad, sizeof(original_pad));
-
-	if (avrc < 0)
-	{
-		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-			"sprite_grabber_decode_keyframe: avcodec_receive_frame failed %d", avrc);
-		return VOD_BAD_DATA;
-	}
-
-	return VOD_OK;
 }
 
 #if (VOD_HAVE_LIB_SW_SCALE)
@@ -636,66 +457,334 @@ sprite_grabber_encode_canvas(sprite_grabber_state_t* state)
 }
 
 vod_status_t
+sprite_grabber_init_state(
+	request_context_t* request_context,
+	media_track_t* track,
+	uint32_t page,
+	uint32_t tile_width,
+	uint32_t tile_height,
+	uint32_t cols,
+	uint32_t rows,
+	uint32_t interval_ms,
+	write_callback_t write_callback,
+	void* write_context,
+	void** result)
+{
+	sprite_grabber_state_t* state;
+	vod_pool_cleanup_t *cln;
+	vod_status_t rc;
+	int avrc;
+	uint32_t max_frame_size;
+	uint32_t base_offset_ms;
+	uint32_t i;
+
+	if (sprite_encoder_codec == NULL)
+	{
+		vod_log_error(VOD_LOG_ERR, request_context->log, 0,
+			"sprite_grabber_init_state: jpeg encoder not available");
+		return VOD_BAD_REQUEST;
+	}
+
+	if (sprite_decoder_codec[track->media_info.codec_id] == NULL)
+	{
+		vod_log_error(VOD_LOG_ERR, request_context->log, 0,
+			"sprite_grabber_init_state: no decoder for codec %uD", track->media_info.codec_id);
+		return VOD_BAD_REQUEST;
+	}
+
+	state = vod_alloc(request_context->pool, sizeof(*state));
+	if (state == NULL)
+	{
+		return VOD_ALLOC_FAILED;
+	}
+
+	vod_memzero(state, sizeof(*state));
+
+	// add cleanup handler
+	cln = vod_pool_cleanup_add(request_context->pool, 0);
+	if (cln == NULL)
+	{
+		return VOD_ALLOC_FAILED;
+	}
+	cln->handler = sprite_grabber_free_state;
+	cln->data = state;
+
+	// calculate tile dimensions
+	if (tile_height == 0 && track->media_info.u.video.width > 0)
+	{
+		tile_height = ((uint64_t)track->media_info.u.video.height * tile_width) /
+			track->media_info.u.video.width;
+	}
+
+	// ensure dimensions are even (required for YUV420P)
+	tile_width = (tile_width + 1) & ~1;
+	tile_height = (tile_height + 1) & ~1;
+
+	state->request_context = request_context;
+	state->write_callback = write_callback;
+	state->write_context = write_context;
+	state->track = track;
+	state->cols = cols;
+	state->rows = rows;
+	state->tile_width = tile_width;
+	state->tile_height = tile_height;
+	state->canvas_width = tile_width * cols;
+	state->canvas_height = tile_height * rows;
+	state->interval_ms = interval_ms;
+	state->page = page;
+	state->total_tiles = cols * rows;
+	state->cur_tile = 0;
+
+	// get video duration
+	state->video_duration_ms = sprite_grabber_get_duration_ms(track,
+		track->media_info.frames_timescale);
+
+	// init decoder
+	rc = sprite_grabber_init_decoder(request_context, &track->media_info, &state->decoder);
+	if (rc != VOD_OK)
+	{
+		return rc;
+	}
+
+	// alloc decoded frame
+	state->decoded_frame = av_frame_alloc();
+	if (state->decoded_frame == NULL)
+	{
+		return VOD_ALLOC_FAILED;
+	}
+
+	state->output_packet = av_packet_alloc();
+	if (state->output_packet == NULL)
+	{
+		return VOD_ALLOC_FAILED;
+	}
+
+	// allocate canvas (YUV420P)
+	avrc = av_image_alloc(
+		state->canvas_data, state->canvas_linesize,
+		state->canvas_width, state->canvas_height,
+		AV_PIX_FMT_YUV420P, 16);
+	if (avrc < 0)
+	{
+		vod_log_error(VOD_LOG_ERR, request_context->log, 0,
+			"sprite_grabber_init_state: av_image_alloc failed for canvas %ux%u",
+			state->canvas_width, state->canvas_height);
+		return VOD_ALLOC_FAILED;
+	}
+
+	// fill canvas with black (Y=0, U=128, V=128)
+	memset(state->canvas_data[0], 0, state->canvas_linesize[0] * state->canvas_height);
+	memset(state->canvas_data[1], 128, state->canvas_linesize[1] * (state->canvas_height / 2));
+	memset(state->canvas_data[2], 128, state->canvas_linesize[2] * (state->canvas_height / 2));
+
+	// init encoder for full canvas
+	state->encoder = avcodec_alloc_context3(sprite_encoder_codec);
+	if (state->encoder == NULL)
+	{
+		return VOD_ALLOC_FAILED;
+	}
+
+	state->encoder->width = state->canvas_width;
+	state->encoder->height = state->canvas_height;
+	state->encoder->time_base = (AVRational){ 1, 1 };
+	state->encoder->pix_fmt = AV_PIX_FMT_YUVJ420P;
+
+	avrc = avcodec_open2(state->encoder, sprite_encoder_codec, NULL);
+	if (avrc < 0)
+	{
+		vod_log_error(VOD_LOG_ERR, request_context->log, 0,
+			"sprite_grabber_init_state: avcodec_open2 encoder failed %d", avrc);
+		return VOD_UNEXPECTED;
+	}
+
+	// find max frame size across all target keyframes for buffer allocation
+	max_frame_size = 0;
+	base_offset_ms = page * state->total_tiles * interval_ms;
+	for (i = 0; i < state->total_tiles; i++)
+	{
+		uint32_t time_ms;
+		frame_list_part_t* kf_part;
+		input_frame_t* kf_frame;
+		uint32_t kf_size;
+
+		time_ms = base_offset_ms + i * interval_ms;
+		if (time_ms >= state->video_duration_ms)
+		{
+			break;
+		}
+
+		rc = sprite_grabber_find_keyframe_at(track, time_ms,
+			track->media_info.frames_timescale, &kf_part, &kf_frame, &kf_size);
+		if (rc == VOD_OK && kf_size > max_frame_size)
+		{
+			max_frame_size = kf_size;
+		}
+	}
+
+	if (max_frame_size == 0)
+	{
+		max_frame_size = 256 * 1024;  // 256KB fallback
+	}
+
+	// allocate frame buffer (reused for each tile)
+	state->frame_buffer = vod_alloc(request_context->pool,
+		max_frame_size + VOD_BUFFER_PADDING_SIZE);
+	if (state->frame_buffer == NULL)
+	{
+		return VOD_ALLOC_FAILED;
+	}
+
+	// start the first tile
+	rc = sprite_grabber_start_next_tile(state);
+	if (rc != VOD_OK)
+	{
+		return rc;
+	}
+
+	*result = state;
+	return VOD_OK;
+}
+
+vod_status_t
 sprite_grabber_process(void* context)
 {
 	sprite_grabber_state_t* state = (sprite_grabber_state_t*)context;
+	u_char* read_buffer;
+	uint32_t read_size;
+	bool_t frame_done;
 	vod_status_t rc;
-	uint32_t base_offset_ms;
-	uint32_t frame_offset_ms;
 	uint32_t col, row;
 
-	base_offset_ms = state->page * state->total_tiles * state->interval_ms;
-
-	// process each tile
-	while (state->cur_tile < state->total_tiles)
+	for (;;)
 	{
-		frame_offset_ms = base_offset_ms + state->cur_tile * state->interval_ms;
-
-		// skip tiles beyond video duration
-		if (frame_offset_ms >= state->video_duration_ms)
+		switch (state->cur_state)
 		{
-			state->cur_tile++;
-			continue;
-		}
-
-		col = state->cur_tile % state->cols;
-		row = state->cur_tile / state->cols;
-
-		// decode the nearest keyframe
-		rc = sprite_grabber_decode_keyframe(state, frame_offset_ms);
-		if (rc != VOD_OK)
-		{
-			if (rc == VOD_AGAIN)
+		case SPRITE_STATE_READ_FRAME:
+			// read frame data from the read cache (like thumb_grabber)
+			rc = state->frames_source->read(
+				state->frames_source_context,
+				&read_buffer,
+				&read_size,
+				&frame_done);
+			if (rc != VOD_OK)
 			{
-				return VOD_AGAIN;
+				if (rc == VOD_AGAIN)
+				{
+					return VOD_AGAIN;  // let framework read more data
+				}
+				// read error, skip this tile
+				vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+					"sprite_grabber_process: read failed %i at tile %uD", rc, state->cur_tile);
+				state->cur_tile++;
+				rc = sprite_grabber_start_next_tile(state);
+				if (rc != VOD_OK)
+				{
+					return rc;
+				}
+				continue;
 			}
-			// skip failed frames
-			vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
-				"sprite_grabber_process: failed to decode frame at %uD ms, skipping", frame_offset_ms);
-			state->cur_tile++;
-			continue;
+
+			// accumulate data in frame buffer
+			vod_memcpy(state->frame_buffer + state->frame_buffer_size,
+				read_buffer, read_size);
+			state->frame_buffer_size += read_size;
+
+			if (!frame_done)
+			{
+				return VOD_AGAIN;  // need more data from framework
+			}
+
+			state->cur_state = SPRITE_STATE_DECODE;
+			// fall through
+
+		case SPRITE_STATE_DECODE:
+		{
+			AVPacket* pkt;
+			int avrc;
+
+			// add padding after frame data
+			vod_memzero(state->frame_buffer + state->frame_buffer_size,
+				VOD_BUFFER_PADDING_SIZE);
+
+			av_frame_unref(state->decoded_frame);
+
+			pkt = av_packet_alloc();
+			if (pkt == NULL)
+			{
+				return VOD_ALLOC_FAILED;
+			}
+
+			pkt->data = state->frame_buffer;
+			pkt->size = state->frame_buffer_size;
+			pkt->flags = AV_PKT_FLAG_KEY;
+
+			avrc = avcodec_send_packet(state->decoder, pkt);
+			av_packet_free(&pkt);
+
+			if (avrc < 0)
+			{
+				vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+					"sprite_grabber_process: avcodec_send_packet failed %d at tile %uD",
+					avrc, state->cur_tile);
+				state->cur_tile++;
+				rc = sprite_grabber_start_next_tile(state);
+				if (rc != VOD_OK)
+				{
+					return rc;
+				}
+				continue;
+			}
+
+			avrc = avcodec_receive_frame(state->decoder, state->decoded_frame);
+			if (avrc < 0)
+			{
+				vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+					"sprite_grabber_process: avcodec_receive_frame failed %d at tile %uD",
+					avrc, state->cur_tile);
+				state->cur_tile++;
+				rc = sprite_grabber_start_next_tile(state);
+				if (rc != VOD_OK)
+				{
+					return rc;
+				}
+				continue;
+			}
+
+			state->cur_state = SPRITE_STATE_RESIZE_PLACE;
+			// fall through
 		}
+
+		case SPRITE_STATE_RESIZE_PLACE:
+			col = state->cur_tile % state->cols;
+			row = state->cur_tile / state->cols;
 
 #if (VOD_HAVE_LIB_SW_SCALE)
-		// resize and place on canvas
-		rc = sprite_grabber_resize_and_place(state, col, row);
-		if (rc != VOD_OK)
-		{
-			state->cur_tile++;
-			continue;
-		}
+			rc = sprite_grabber_resize_and_place(state, col, row);
+			if (rc != VOD_OK)
+			{
+				vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+					"sprite_grabber_process: resize_and_place failed at tile %uD", state->cur_tile);
+			}
 #else
-		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-			"sprite_grabber_process: libswscale is required for sprite generation");
-		return VOD_BAD_REQUEST;
+			vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+				"sprite_grabber_process: libswscale is required for sprite generation");
+			return VOD_BAD_REQUEST;
 #endif
 
-		// flush decoder for next frame
-		avcodec_flush_buffers(state->decoder);
+			// flush decoder for next frame
+			avcodec_flush_buffers(state->decoder);
 
-		state->cur_tile++;
+			// advance to next tile
+			state->cur_tile++;
+			rc = sprite_grabber_start_next_tile(state);
+			if (rc != VOD_OK)
+			{
+				return rc;
+			}
+			continue;  // back to switch
+
+		case SPRITE_STATE_ENCODE:
+			return sprite_grabber_encode_canvas(state);
+		}
 	}
-
-	// all tiles processed, encode the canvas
-	return sprite_grabber_encode_canvas(state);
 }

@@ -114,7 +114,7 @@ ngx_http_vod_sprite_handle_metadata(
 			"%V-%uD.jpg#xywh=%uD,%uD,%uD,%uD\n\n",
 			start_sec / 3600, (start_sec % 3600) / 60, start_sec % 60, start_ms,
 			end_sec / 3600, (end_sec % 3600) / 60, end_sec % 60, end_ms,
-			&conf->sprite.file_name_prefix, page,
+			&conf->sprite.file_name_prefix, page + 1,
 			col * tile_width, row * tile_height,
 			tile_width, tile_height);
 	}
@@ -283,10 +283,10 @@ ngx_http_vod_sprite_parse_uri_file_name(
 		start_pos++;
 	}
 
-	if (start_pos >= end_pos || *start_pos < '0' || *start_pos > '9')
+	if (start_pos >= end_pos || *start_pos < '1' || *start_pos > '9')
 	{
 		ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-			"ngx_http_vod_sprite_parse_uri_file_name: failed to parse page number");
+			"ngx_http_vod_sprite_parse_uri_file_name: failed to parse page number (must be >= 1)");
 		return ngx_http_vod_status_to_ngx_error(r, VOD_BAD_REQUEST);
 	}
 
@@ -297,7 +297,7 @@ ngx_http_vod_sprite_parse_uri_file_name(
 			page = page * 10 + (*start_pos++ - '0');
 		}
 
-		request_params->segment_index = page;  // reuse segment_index for page
+		request_params->segment_index = page - 1;  // convert 1-based URL to 0-based internal
 	}
 
 	// parse optional width/height: -w{width}[-h{height}]

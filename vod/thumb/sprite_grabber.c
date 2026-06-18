@@ -291,6 +291,9 @@ sprite_grabber_start_next_tile(sprite_grabber_state_t* state)
 		if (frame_offset_ms >= state->video_duration_ms)
 		{
 			// beyond video, skip
+			vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+				"sprite_grabber_start_next_tile: tile %uD skipped, offset=%uD >= duration=%uL",
+				state->cur_tile, frame_offset_ms, state->video_duration_ms);
 			state->cur_tile++;
 			continue;
 		}
@@ -304,6 +307,9 @@ sprite_grabber_start_next_tile(sprite_grabber_state_t* state)
 			&frame_size);
 		if (rc != VOD_OK)
 		{
+			vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+				"sprite_grabber_start_next_tile: find_keyframe failed %i at tile %uD offset=%uD",
+				rc, state->cur_tile, frame_offset_ms);
 			state->cur_tile++;
 			continue;
 		}
@@ -323,6 +329,10 @@ sprite_grabber_start_next_tile(sprite_grabber_state_t* state)
 			state->cur_tile++;
 			continue;
 		}
+
+		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+			"sprite_grabber_start_next_tile: processing tile %uD offset=%uD frame_size=%uD",
+			state->cur_tile, frame_offset_ms, frame_size);
 
 		state->frame_buffer_size = 0;
 		state->cur_state = SPRITE_STATE_READ_FRAME;
@@ -538,6 +548,11 @@ sprite_grabber_init_state(
 	// get video duration
 	state->video_duration_ms = sprite_grabber_get_duration_ms(track,
 		track->media_info.frames_timescale);
+
+	vod_log_error(VOD_LOG_ERR, request_context->log, 0,
+		"sprite_grabber_init_state: page=%uD tiles=%uD duration_ms=%uL timescale=%uD frame_count=%uD",
+		page, state->total_tiles, state->video_duration_ms,
+		track->media_info.frames_timescale, track->frame_count);
 
 	// init decoder
 	rc = sprite_grabber_init_decoder(request_context, &track->media_info, &state->decoder);

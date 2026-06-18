@@ -493,20 +493,6 @@ sprite_grabber_read_nal_size(u_char* p, uint32_t nal_length_size)
 	return result;
 }
 
-static vod_status_t
-sprite_grabber_reset_decoder(sprite_grabber_state_t* state)
-{
-	if (state->decoder != NULL)
-	{
-		avcodec_close(state->decoder);
-		av_free(state->decoder);
-		state->decoder = NULL;
-	}
-
-	return sprite_grabber_init_decoder(
-		state->request_context, &state->track->media_info, &state->decoder);
-}
-
 static bool_t
 sprite_grabber_nal_is_vcl(uint32_t codec_id, uint8_t nal_type)
 {
@@ -706,11 +692,8 @@ sprite_grabber_decode_tile(sprite_grabber_state_t* state)
 		return VOD_UNEXPECTED;
 	}
 
-	rc = sprite_grabber_reset_decoder(state);
-	if (rc != VOD_OK)
-	{
-		return rc;
-	}
+	// reset decoder state before decoding this independent keyframe
+	avcodec_flush_buffers(state->decoder);
 
 	input_packet = av_packet_alloc();
 	if (input_packet == NULL)
@@ -747,12 +730,20 @@ sprite_grabber_decode_tile(sprite_grabber_state_t* state)
 	avrc = avcodec_receive_frame(state->decoder, state->decoded_frame);
 	if (avrc == AVERROR(EAGAIN))
 	{
-		vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
-			"sprite_grabber_decode_tile: avcodec_receive_frame needs more input at tile %uD, skipping",
-			state->cur_tile);
-		return VOD_UNEXPECTED;
+		// single keyframe packet: drain the decoder to flush out the frame
+		avrc = avcodec_send_packet(state->decoder, NULL);
+		if (avrc < 0)
+		{
+			vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+				"sprite_grabber_decode_tile: drain send_packet failed %d at tile %uD",
+				avrc, state->cur_tile);
+			return VOD_UNEXPECTED;
+		}
+
+		avrc = avcodec_receive_frame(state->decoder, state->decoded_frame);
 	}
-	else if (avrc < 0)
+
+	if (avrc < 0)
 	{
 		vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
 			"sprite_grabber_decode_tile: avcodec_receive_frame failed %d at tile %uD",
@@ -1153,9 +1144,10 @@ sprite_grabber_init_state(
 	}
 
 	vod_log_error(VOD_LOG_ERR, request_context->log, 0,
-		"sprite_grabber_init_state: page=%uD canvas=%ux%u encode_height=%uD duration_ms=%uL",
-		page + 1, state->canvas_width, state->canvas_height,
-		state->encode_height, (unsigned long)state->video_duration_ms);
+		"sprite_grabber_init_state: page=%uD canvas_w=%uD canvas_h=%uD encode_height=%uD duration_ms=%uL codec=%uD",
+		(uint32_t)(page + 1), state->canvas_width, state->canvas_height,
+		state->encode_height, state->video_duration_ms,
+		(uint32_t)track->media_info.codec_id);
 
 	state->output_packet = av_packet_alloc();
 	if (state->output_packet == NULL)

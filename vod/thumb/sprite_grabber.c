@@ -692,6 +692,11 @@ sprite_grabber_decode_tile(sprite_grabber_state_t* state)
 		return VOD_UNEXPECTED;
 	}
 
+	vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+		"sprite_grabber_decode_tile: STAGE decode-enter tile=%uD offset=%uD ms size=%uD key=%uD dts=%uL",
+		state->cur_tile, tile_offset_ms, frame->size,
+		(uint32_t)frame->key_frame, state->cur_keyframe_dts);
+
 	// reset decoder state before decoding this independent keyframe
 	avcodec_flush_buffers(state->decoder);
 
@@ -756,6 +761,11 @@ sprite_grabber_decode_tile(sprite_grabber_state_t* state)
 	{
 		return VOD_UNEXPECTED;
 	}
+
+	vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+		"sprite_grabber_decode_tile: STAGE decode-ok tile=%uD %dx%d fmt=%d",
+		state->cur_tile, state->decoded_frame->width,
+		state->decoded_frame->height, state->decoded_frame->format);
 
 	rc = sprite_grabber_copy_to_working_frame(state);
 	if (rc != VOD_OK)
@@ -877,6 +887,12 @@ sprite_grabber_resize_and_place(
 		return VOD_UNEXPECTED;
 	}
 
+	vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+		"sprite_grabber_resize_and_place: STAGE resize-enter tile=%uD in=%dx%d fmt=%d ls0=%d ls1=%d ls2=%d -> tile=%uDx%uD",
+		state->cur_tile, input_frame->width, input_frame->height, input_frame->format,
+		input_frame->linesize[0], input_frame->linesize[1], input_frame->linesize[2],
+		state->tile_width, state->tile_height);
+
 	sws_ctx = sws_getContext(
 		input_frame->width, input_frame->height, input_frame->format,
 		state->tile_width, state->tile_height, AV_PIX_FMT_YUV420P,
@@ -908,6 +924,9 @@ sprite_grabber_resize_and_place(
 			tile_data, tile_linesize);
 
 		sws_freeContext(sws_ctx);
+
+		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+			"sprite_grabber_resize_and_place: STAGE scale-done tile=%uD", state->cur_tile);
 
 		// copy tile pixels into canvas at (col, row) position
 		// Y plane
@@ -992,6 +1011,10 @@ sprite_grabber_encode_canvas(sprite_grabber_state_t* state)
 {
 	AVFrame* canvas_frame;
 	int avrc;
+
+	vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+		"sprite_grabber_encode_canvas: STAGE encode-enter w=%uD h=%uD",
+		state->canvas_width, state->encode_height);
 
 	canvas_frame = av_frame_alloc();
 	if (canvas_frame == NULL)

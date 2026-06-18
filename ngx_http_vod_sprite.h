@@ -1,0 +1,6 @@
+#ifndef _NGX_HTTP_VOD_SPRITE_H_INCLUDED_
+#define _NGX_HTTP_VOD_SPRITE_H_INCLUDED_
+
+#include <ngx_http.h>
+
+#endif // _NGX_HTTP_VOD_SPRITE_H_INCLUDED_

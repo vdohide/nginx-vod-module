@@ -12,6 +12,7 @@
 
 #if (NGX_HAVE_LIB_AV_CODEC)
 #include "ngx_http_vod_thumb_conf.h"
+#include "ngx_http_vod_sprite_conf.h"
 #include "ngx_http_vod_volume_map_conf.h"
 #endif // NGX_HAVE_LIB_AV_CODEC
 
@@ -118,6 +119,7 @@ struct ngx_http_vod_loc_conf_s {
 
 #if (NGX_HAVE_LIB_AV_CODEC)
 	ngx_http_vod_thumb_loc_conf_t thumb;
+	ngx_http_vod_sprite_loc_conf_t sprite;
 	ngx_http_vod_volume_map_loc_conf_t volume_map;
 #endif // NGX_HAVE_LIB_AV_CODEC
 };

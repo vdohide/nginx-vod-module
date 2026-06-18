@@ -5,6 +5,7 @@
 
 #if (NGX_HAVE_LIB_AV_CODEC)
 #include "ngx_http_vod_thumb.h"
+#include "ngx_http_vod_sprite.h"
 #include "ngx_http_vod_volume_map.h"
 #endif // NGX_HAVE_LIB_AV_CODEC
 
@@ -15,6 +16,7 @@ const ngx_http_vod_submodule_t* submodules[] = {
 	&mss,
 #if (NGX_HAVE_LIB_AV_CODEC)
 	&thumb,
+	&sprite,
 	&volume_map,
 #endif // NGX_HAVE_LIB_AV_CODEC
 	NULL,

@@ -184,7 +184,7 @@ static const ngx_http_vod_request_t sprite_jpg_request = {
 	PARSE_FLAG_FRAMES_ALL | PARSE_FLAG_EXTRA_DATA,
 	REQUEST_CLASS_OTHER,
 	VOD_CODEC_FLAG(AVC) | VOD_CODEC_FLAG(HEVC) | VOD_CODEC_FLAG(VP8) | VOD_CODEC_FLAG(VP9) | VOD_CODEC_FLAG(AV1),
-	0,
+	SPRITE_TIMESCALE,
 	NULL,
 	ngx_http_vod_sprite_init_frame_processor,
 };

@@ -11,7 +11,7 @@
 #define SPRITE_DEFAULT_INTERVAL    (1000)    // ms between frames
 #define SPRITE_DEFAULT_TILE_WIDTH  (160)     // fallback only (height-primary by default)
 #define SPRITE_DEFAULT_TILE_HEIGHT (160)     // fixed tile height; width derived from aspect ratio
-#define SPRITE_DEFAULT_QUALITY     (75)
+#define SPRITE_DEFAULT_QUALITY     (90)
 
 // functions
 void sprite_grabber_process_init(vod_log_t* log);

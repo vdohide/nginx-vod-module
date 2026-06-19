@@ -54,23 +54,24 @@ typedef struct
 	// state machine
 	int cur_state;
 
-	// keyframe-snap sampling: each tile is mapped to the nearest keyframe so we
-	// only decode keyframes (cheap, ~one decode per keyframe) instead of every
-	// frame. Keyframes are decoded independently (intra), and the result is
-	// reused for consecutive tiles that snap to the same keyframe.
-	uint32_t timescale;
-	uint32_t tiles_in_page;
-	uint32_t cur_tile;             // tile being produced (0-based within page)
-	input_frame_t** snap_frame;    // array[tiles_in_page] keyframe per tile (NULL = none)
-	frame_list_part_t** snap_part; // array[tiles_in_page] the keyframe's frame list part
-	uint64_t* snap_dts;            // array[tiles_in_page] keyframe dts (timescale units)
-
-	input_frame_t* last_decoded_frame;  // last keyframe we attempted to decode
-	int has_frame;                       // working_frame holds a valid decoded frame
+	// forward frame iteration / decoding (like thumb_grabber): decode every
+	// frame in decode order from the start keyframe so the decoder has proper
+	// reference frames, then sample one decoded frame per tile by timestamp.
+	frame_list_part_t cur_frame_part;
+	input_frame_t* cur_frame;
 	bool_t frame_started;
+	uint64_t dts;
+	uint32_t missing_frames;
+	int has_frame;
 	u_char* frame_buffer;
 	uint32_t cur_frame_pos;
 	uint32_t max_frame_size;
+
+	// tile targets (one decoded frame is sampled per tile by timestamp)
+	uint32_t timescale;
+	uint32_t tiles_in_page;
+	uint32_t next_tile;        // next tile index (0-based within page) to fill
+	uint64_t* target_ts;       // array[tiles_in_page] of target pts (timescale units)
 
 } sprite_grabber_state_t;
 
@@ -557,63 +558,60 @@ static vod_status_t sprite_grabber_resize_and_place(
 	sprite_grabber_state_t* state, AVFrame* input_frame, uint32_t col, uint32_t row);
 #endif // VOD_HAVE_LIB_SW_SCALE
 
-// place the current working_frame into the given tile of the grid
+// place the current working_frame into every pending tile whose target
+// timestamp has been reached by the given decoded frame pts. Multiple tiles
+// may map to the same frame when frames are sparse near the end.
 static vod_status_t
-sprite_grabber_place_tile(sprite_grabber_state_t* state, uint32_t tile)
+sprite_grabber_assign_frame(sprite_grabber_state_t* state, int64_t frame_pts)
 {
-	uint32_t col = tile % state->cols;
-	uint32_t row = tile / state->cols;
+	uint32_t col, row;
 
-	if (!state->has_frame ||
-		!sprite_grabber_validate_frame(
-			state->working_frame, state->request_context->log, tile))
+	if (!sprite_grabber_validate_frame(
+		state->working_frame, state->request_context->log, state->next_tile))
 	{
-		// no decoded frame yet (e.g. first keyframe failed): leave tile black
 		return VOD_OK;
 	}
 
-#if (VOD_HAVE_LIB_SW_SCALE)
+	while (state->next_tile < state->tiles_in_page &&
+		frame_pts >= (int64_t)state->target_ts[state->next_tile])
 	{
-		vod_status_t rc = sprite_grabber_resize_and_place(
-			state, state->working_frame, col, row);
-		if (rc != VOD_OK)
+		col = state->next_tile % state->cols;
+		row = state->next_tile / state->cols;
+
+#if (VOD_HAVE_LIB_SW_SCALE)
 		{
-			vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
-				"sprite_grabber_place_tile: resize_and_place failed at tile %uD", tile);
+			vod_status_t rc = sprite_grabber_resize_and_place(
+				state, state->working_frame, col, row);
+			if (rc != VOD_OK)
+			{
+				vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+					"sprite_grabber_assign_frame: resize_and_place failed at tile %uD",
+					state->next_tile);
+			}
 		}
-	}
 #else
-	vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
-		"sprite_grabber_place_tile: libswscale is required for sprite generation");
-	return VOD_BAD_REQUEST;
+		vod_log_error(VOD_LOG_ERR, state->request_context->log, 0,
+			"sprite_grabber_assign_frame: libswscale is required for sprite generation");
+		return VOD_BAD_REQUEST;
 #endif
+
+		state->next_tile++;
+	}
 
 	return VOD_OK;
 }
 
-// decode the keyframe snapped to the current tile, independently (it is intra,
-// so a flush + single packet is enough). On any failure we keep the previous
-// working_frame so the tile reuses the last good keyframe instead of going
-// black or crashing.
+// decode a single frame (in decode order) and assign it to any tiles it covers
 static vod_status_t
-sprite_grabber_decode_keyframe(sprite_grabber_state_t* state)
+sprite_grabber_decode_frame(sprite_grabber_state_t* state, u_char* buffer)
 {
-	input_frame_t* frame = state->snap_frame[state->cur_tile];
+	input_frame_t* frame = state->cur_frame;
 	AVPacket* input_packet;
+	u_char original_pad[VOD_BUFFER_PADDING_SIZE];
+	u_char* frame_end;
+	int64_t frame_pts;
 	int avrc;
 	vod_status_t rc;
-
-	// mark this keyframe as attempted so a failure is not retried by tiles that
-	// snap to the same keyframe
-	state->last_decoded_frame = frame;
-
-	if (frame == NULL || frame->size == 0 ||
-		state->cur_frame_pos != frame->size)
-	{
-		return VOD_OK;  // reuse previous working_frame
-	}
-
-	avcodec_flush_buffers(state->decoder);
 
 	input_packet = av_packet_alloc();
 	if (input_packet == NULL)
@@ -621,50 +619,56 @@ sprite_grabber_decode_keyframe(sprite_grabber_state_t* state)
 		return VOD_ALLOC_FAILED;
 	}
 
-	avrc = av_new_packet(input_packet, frame->size);
-	if (avrc < 0)
-	{
-		av_packet_free(&input_packet);
-		return VOD_ALLOC_FAILED;
-	}
-
-	vod_memcpy(input_packet->data, state->frame_buffer, frame->size);
-	input_packet->dts = state->snap_dts[state->cur_tile];
-	input_packet->pts = state->snap_dts[state->cur_tile] + frame->pts_delay;
+	input_packet->data = buffer;
+	input_packet->size = frame->size;
+	input_packet->dts = state->dts;
+	input_packet->pts = state->dts + frame->pts_delay;
 	input_packet->duration = frame->duration;
-	input_packet->flags = AV_PKT_FLAG_KEY;
+	input_packet->flags = frame->key_frame ? AV_PKT_FLAG_KEY : 0;
+	state->dts += frame->duration;
 
 	av_frame_unref(state->decoded_frame);
 
+	// libavcodec may read past the end of the buffer; zero the padding and
+	// restore it afterwards (the buffer has VOD_BUFFER_PADDING_SIZE padding).
+	frame_end = buffer + frame->size;
+	vod_memcpy(original_pad, frame_end, sizeof(original_pad));
+	vod_memzero(frame_end, sizeof(original_pad));
+
 	avrc = avcodec_send_packet(state->decoder, input_packet);
 	av_packet_free(&input_packet);
+
+	vod_memcpy(frame_end, original_pad, sizeof(original_pad));
+
 	if (avrc < 0)
 	{
 		vod_log_debug1(VOD_LOG_DEBUG_LEVEL, state->request_context->log, 0,
-			"sprite_grabber_decode_keyframe: send_packet failed %d, reusing previous", avrc);
-		return VOD_OK;
+			"sprite_grabber_decode_frame: send_packet failed %d", avrc);
+		return VOD_OK;  // skip this frame, keep going
 	}
 
 	avrc = avcodec_receive_frame(state->decoder, state->decoded_frame);
 	if (avrc == AVERROR(EAGAIN))
 	{
-		// single packet: drain to flush the frame out
-		avrc = avcodec_send_packet(state->decoder, NULL);
-		if (avrc >= 0)
-		{
-			avrc = avcodec_receive_frame(state->decoder, state->decoded_frame);
-		}
+		// decoder needs more input (B-frame reordering); will catch up later
+		state->missing_frames++;
+		return VOD_OK;
 	}
 
 	if (avrc < 0)
 	{
 		vod_log_debug1(VOD_LOG_DEBUG_LEVEL, state->request_context->log, 0,
-			"sprite_grabber_decode_keyframe: receive_frame failed %d, reusing previous", avrc);
+			"sprite_grabber_decode_frame: receive_frame failed %d", avrc);
 		return VOD_OK;
 	}
 
+	if (state->missing_frames > 0)
+	{
+		state->missing_frames--;
+	}
+
 	if (!sprite_grabber_validate_frame(
-		state->decoded_frame, state->request_context->log, state->cur_tile))
+		state->decoded_frame, state->request_context->log, state->next_tile))
 	{
 		return VOD_OK;
 	}
@@ -676,7 +680,85 @@ sprite_grabber_decode_keyframe(sprite_grabber_state_t* state)
 	}
 	state->has_frame = 1;
 
+	frame_pts = state->decoded_frame->best_effort_timestamp;
+	if (frame_pts == AV_NOPTS_VALUE)
+	{
+		frame_pts = state->decoded_frame->pts;
+	}
+	if (frame_pts == AV_NOPTS_VALUE)
+	{
+		frame_pts = (state->next_tile < state->tiles_in_page) ?
+			(int64_t)state->target_ts[state->next_tile] : 0;
+	}
+
+	return sprite_grabber_assign_frame(state, frame_pts);
+}
+
+// drain the decoder to flush buffered frames (after the last input packet)
+static vod_status_t
+sprite_grabber_decode_flush(sprite_grabber_state_t* state)
+{
+	int64_t frame_pts;
+	int avrc;
+	vod_status_t rc;
+
+	avrc = avcodec_send_packet(state->decoder, NULL);
+	if (avrc < 0)
+	{
+		return VOD_OK;
+	}
+
+	for (;;)
+	{
+		av_frame_unref(state->decoded_frame);
+
+		avrc = avcodec_receive_frame(state->decoder, state->decoded_frame);
+		if (avrc < 0)
+		{
+			break;  // EOF or EAGAIN
+		}
+
+		if (!sprite_grabber_validate_frame(
+			state->decoded_frame, state->request_context->log, state->next_tile))
+		{
+			continue;
+		}
+
+		rc = sprite_grabber_copy_to_working_frame(state);
+		if (rc != VOD_OK)
+		{
+			return rc;
+		}
+		state->has_frame = 1;
+
+		frame_pts = state->decoded_frame->best_effort_timestamp;
+		if (frame_pts == AV_NOPTS_VALUE)
+		{
+			frame_pts = state->decoded_frame->pts;
+		}
+
+		rc = sprite_grabber_assign_frame(state, frame_pts);
+		if (rc != VOD_OK)
+		{
+			return rc;
+		}
+	}
+
 	return VOD_OK;
+}
+
+// fill any tiles still pending with the last decoded frame, so trailing tiles
+// (e.g. the final partial page) are not left black
+static vod_status_t
+sprite_grabber_fill_remaining_tiles(sprite_grabber_state_t* state)
+{
+	if (state->next_tile >= state->tiles_in_page || !state->has_frame)
+	{
+		return VOD_OK;
+	}
+
+	return sprite_grabber_assign_frame(
+		state, (int64_t)state->target_ts[state->tiles_in_page - 1]);
 }
 
 #if (VOD_HAVE_LIB_SW_SCALE)
@@ -700,7 +782,7 @@ sprite_grabber_resize_and_place(
 	{
 		vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
 			"sprite_grabber_resize_and_place: tile %uD at (%uD,%uD) exceeds canvas %ux%u",
-			state->cur_tile, col, row, state->canvas_width, state->canvas_height);
+			state->next_tile, col, row, state->canvas_width, state->canvas_height);
 		return VOD_UNEXPECTED;
 	}
 
@@ -708,7 +790,7 @@ sprite_grabber_resize_and_place(
 	{
 		vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
 			"sprite_grabber_resize_and_place: invalid decoded frame size at tile %uD",
-			state->cur_tile);
+			state->next_tile);
 		return VOD_UNEXPECTED;
 	}
 
@@ -1042,13 +1124,15 @@ sprite_grabber_init_state(
 		return VOD_ALLOC_FAILED;
 	}
 
-	// snap every tile to its nearest preceding keyframe, so we only decode
-	// keyframes (cheap) instead of every frame in the page span
+	// plan tile target timestamps for this page and locate the start keyframe
 	{
 		uint32_t total_content_tiles;
 		uint32_t page_first_tile;
 		uint64_t base_offset_ms;
 		uint32_t i;
+		frame_list_part_t* start_part;
+		input_frame_t* start_frame;
+		uint64_t start_dts;
 
 		total_content_tiles = sprite_grabber_get_total_content_tiles(
 			state->video_duration_ms, interval_ms);
@@ -1077,14 +1161,9 @@ sprite_grabber_init_state(
 			return VOD_OK;
 		}
 
-		state->snap_frame = vod_alloc(request_context->pool,
-			state->tiles_in_page * sizeof(state->snap_frame[0]));
-		state->snap_part = vod_alloc(request_context->pool,
-			state->tiles_in_page * sizeof(state->snap_part[0]));
-		state->snap_dts = vod_alloc(request_context->pool,
-			state->tiles_in_page * sizeof(state->snap_dts[0]));
-		if (state->snap_frame == NULL || state->snap_part == NULL ||
-			state->snap_dts == NULL)
+		state->target_ts = vod_alloc(request_context->pool,
+			state->tiles_in_page * sizeof(state->target_ts[0]));
+		if (state->target_ts == NULL)
 		{
 			return VOD_ALLOC_FAILED;
 		}
@@ -1092,37 +1171,33 @@ sprite_grabber_init_state(
 		for (i = 0; i < state->tiles_in_page; i++)
 		{
 			uint64_t tile_ms = base_offset_ms + (uint64_t)i * interval_ms;
-			frame_list_part_t* kf_part;
-			input_frame_t* kf_frame;
-			uint64_t kf_dts;
-
-			rc = sprite_grabber_find_keyframe_at(
-				track,
-				tile_ms,
-				state->timescale,
-				&kf_part,
-				&kf_frame,
-				NULL,
-				&kf_dts);
-			if (rc != VOD_OK)
-			{
-				// no keyframe for this tile: mark empty (reuses previous frame)
-				state->snap_frame[i] = NULL;
-				state->snap_part[i] = NULL;
-				state->snap_dts[i] = 0;
-				continue;
-			}
-
-			state->snap_frame[i] = kf_frame;
-			state->snap_part[i] = kf_part;
-			state->snap_dts[i] = kf_dts;
+			state->target_ts[i] = (tile_ms * state->timescale) / 1000;
 		}
 
-		state->cur_tile = 0;
-		state->last_decoded_frame = NULL;
-		state->has_frame = 0;
+		// find the keyframe at or before the first tile's time to start decoding
+		rc = sprite_grabber_find_keyframe_at(
+			track,
+			base_offset_ms,
+			state->timescale,
+			&start_part,
+			&start_frame,
+			NULL,
+			&start_dts);
+		if (rc != VOD_OK)
+		{
+			vod_log_error(VOD_LOG_ERR, request_context->log, 0,
+				"sprite_grabber_init_state: no keyframe found for page %uD", (uint32_t)(page + 1));
+			return rc;
+		}
+
+		state->cur_frame_part = *start_part;
+		state->cur_frame = start_frame;
+		state->dts = start_dts;
 		state->frame_started = FALSE;
+		state->missing_frames = 0;
+		state->has_frame = 0;
 		state->cur_frame_pos = 0;
+		state->next_tile = 0;
 		state->cur_state = SPRITE_STATE_DECODE_FRAMES;
 	}
 
@@ -1138,7 +1213,6 @@ sprite_grabber_process(void* context)
 	uint32_t read_size;
 	bool_t frame_done;
 	vod_status_t rc;
-	input_frame_t* kf;
 
 	for (;;)
 	{
@@ -1147,38 +1221,48 @@ sprite_grabber_process(void* context)
 			return sprite_grabber_encode_canvas(state);
 		}
 
-		// SPRITE_STATE_DECODE_FRAMES: produce one tile at a time. Each tile is
-		// snapped to a keyframe; we only decode that keyframe (intra), and reuse
-		// the result for consecutive tiles that snap to the same keyframe.
+		// SPRITE_STATE_DECODE_FRAMES: walk frames forward from the start
+		// keyframe, decoding each in order so the decoder has proper reference
+		// frames (like thumb_grabber). Each decoded frame is sampled into the
+		// tiles whose target timestamp it covers (accurate per-second frames).
 
-		// all tiles produced -> encode
-		if (state->cur_tile >= state->tiles_in_page)
+		// all tiles filled -> done
+		if (state->next_tile >= state->tiles_in_page)
 		{
 			state->cur_state = SPRITE_STATE_ENCODE;
 			continue;
 		}
 
-		kf = state->snap_frame[state->cur_tile];
-
-		// reuse the last decoded keyframe (same snap target, or no keyframe for
-		// this tile) without re-reading/decoding
-		if (kf == NULL || kf == state->last_decoded_frame)
-		{
-			rc = sprite_grabber_place_tile(state, state->cur_tile);
-			if (rc != VOD_OK)
-			{
-				return rc;
-			}
-			state->cur_tile++;
-			continue;
-		}
-
-		// start reading the keyframe if not started yet
+		// start a frame if needed
 		if (!state->frame_started)
 		{
-			rc = state->snap_part[state->cur_tile]->frames_source->start_frame(
-				state->snap_part[state->cur_tile]->frames_source_context,
-				kf,
+			if (state->cur_frame >= state->cur_frame_part.last_frame)
+			{
+				if (state->cur_frame_part.next == NULL)
+				{
+					// ran out of frames before filling every tile: flush the
+					// decoder, then fill any trailing tiles with the last frame
+					rc = sprite_grabber_decode_flush(state);
+					if (rc != VOD_OK)
+					{
+						return rc;
+					}
+					rc = sprite_grabber_fill_remaining_tiles(state);
+					if (rc != VOD_OK)
+					{
+						return rc;
+					}
+					state->cur_state = SPRITE_STATE_ENCODE;
+					continue;
+				}
+
+				state->cur_frame_part = *state->cur_frame_part.next;
+				state->cur_frame = state->cur_frame_part.first_frame;
+			}
+
+			rc = state->cur_frame_part.frames_source->start_frame(
+				state->cur_frame_part.frames_source_context,
+				state->cur_frame,
 				NULL);
 			if (rc != VOD_OK)
 			{
@@ -1189,9 +1273,9 @@ sprite_grabber_process(void* context)
 			state->cur_frame_pos = 0;
 		}
 
-		// read a chunk of the keyframe
-		rc = state->snap_part[state->cur_tile]->frames_source->read(
-			state->snap_part[state->cur_tile]->frames_source_context,
+		// read a chunk of the current frame
+		rc = state->cur_frame_part.frames_source->read(
+			state->cur_frame_part.frames_source_context,
 			&read_buffer,
 			&read_size,
 			&frame_done);
@@ -1204,40 +1288,42 @@ sprite_grabber_process(void* context)
 			return VOD_AGAIN;  // let the framework read more data
 		}
 
-		// accumulate into the frame buffer
-		if (state->cur_frame_pos + read_size >
-			state->max_frame_size + VOD_BUFFER_PADDING_SIZE)
-		{
-			vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
-				"sprite_grabber_process: keyframe too large (%uD bytes)",
-				state->cur_frame_pos + read_size);
-			return VOD_BAD_DATA;
-		}
-
-		vod_memcpy(state->frame_buffer + state->cur_frame_pos,
-			read_buffer, read_size);
-		state->cur_frame_pos += read_size;
-
 		if (!frame_done)
 		{
-			continue;  // keyframe spans multiple cache buffers
+			// frame spans multiple cache buffers: accumulate
+			if (state->cur_frame_pos + read_size >
+				state->max_frame_size + VOD_BUFFER_PADDING_SIZE)
+			{
+				vod_log_error(VOD_LOG_WARN, state->request_context->log, 0,
+					"sprite_grabber_process: frame too large (%uD bytes)",
+					state->cur_frame_pos + read_size);
+				return VOD_BAD_DATA;
+			}
+
+			vod_memcpy(state->frame_buffer + state->cur_frame_pos,
+				read_buffer, read_size);
+			state->cur_frame_pos += read_size;
+			continue;
 		}
 
-		// decode the keyframe (independently) into working_frame
-		rc = sprite_grabber_decode_keyframe(state);
+		if (state->cur_frame_pos != 0)
+		{
+			// copy the trailing chunk and decode from the accumulation buffer
+			vod_memcpy(state->frame_buffer + state->cur_frame_pos,
+				read_buffer, read_size);
+			state->cur_frame_pos = 0;
+			read_buffer = state->frame_buffer;
+		}
+
+		// decode this frame and assign it to any tiles it covers
+		rc = sprite_grabber_decode_frame(state, read_buffer);
 		if (rc != VOD_OK)
 		{
 			return rc;
 		}
 
+		// advance to the next frame in decode order
+		state->cur_frame++;
 		state->frame_started = FALSE;
-
-		// place into the current tile and advance
-		rc = sprite_grabber_place_tile(state, state->cur_tile);
-		if (rc != VOD_OK)
-		{
-			return rc;
-		}
-		state->cur_tile++;
 	}
 }
